@@ -1,0 +1,58 @@
+{
+  "name": "@commanderturtle/leetcoder",
+  "version": "0.1.0",
+  "description": "Confirmation-gated Hermes delegation to persistent, isolated oh-my-pi coding sessions",
+  "type": "module",
+  "license": "MIT",
+  "author": "CommanderTurtle",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CommanderTurtle/leetcoder.git"
+  },
+  "homepage": "https://github.com/CommanderTurtle/leetcoder#readme",
+  "bugs": {
+    "url": "https://github.com/CommanderTurtle/leetcoder/issues"
+  },
+  "keywords": [
+    "hermes-agent",
+    "oh-my-pi",
+    "omp",
+    "mcp",
+    "agent-delegation",
+    "bun",
+    "git-worktree"
+  ],
+  "bin": {
+    "leetcoder": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts src/mcp.ts --outdir dist --target bun --sourcemap=external",
+    "check": "tsc --noEmit",
+    "setup": "bun scripts/setup.ts",
+    "start": "bun src/cli.ts serve",
+    "doctor": "bun src/cli.ts doctor"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "yaml": "^2.9.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist",
+    "src",
+    "scripts",
+    "rules",
+    "skills",
+    ".env.example",
+    "leetcoder.config.example.json",
+    "README.md",
+    "LICENSE"
+  ]
+}

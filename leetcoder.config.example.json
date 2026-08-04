@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 4749,
+    "tokenFile": "~/.config/leetcoder/token"
+  },
+  "omp": {
+    "command": "~/.bun/bin/omp",
+    "profile": "leetcoder",
+    "maxWorkers": 3,
+    "idleSeconds": 7200,
+    "thinking": "high"
+  },
+  "paths": {
+    "dataRoot": "~/.local/share/leetcoder"
+  },
+  "confirmation": {
+    "ttlMinutes": 15
+  },
+  "history": {
+    "eventsPerSession": 5000
+  }
+}
