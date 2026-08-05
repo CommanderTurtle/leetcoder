@@ -1,29 +1,30 @@
 ---
 name: leetcoder
-description: Delegate bounded implementation, bug-fix, audit, refactor, test, research, web, or comparison work from Hermes to persistent isolated OMP sessions. Use when parallel coding or a separately steerable specialist session would materially help.
+description: Autonomously delegate bounded implementation, bug-fix, audit, refactor, test, research, web, or comparison work from Hermes to persistent worktree-isolated OMP sessions. Use when parallel coding or a separately steerable specialist session would materially help.
 ---
 
 # Leetcoder delegation
 
-Leetcoder is a confirmation-gated Hermes MCP. It owns native OMP RPC sessions,
-isolated git worktrees, persistent history, steering, and durable Librarian
-handoffs.
+Leetcoder is Hermes' autonomous OMP control pane. It owns native OMP RPC
+sessions, isolated git worktrees, persistent history, steering, Advisor review,
+automatic recovery, and durable Librarian handoffs. Its SQLite state survives
+Hermes compaction and gateway restarts.
 
 ## Mandatory start flow
 
-1. Call `leetcoder_delegate` with a short title, complete task, the closest
-   template, repository, base ref, and relevant files.
-2. Read its response. Tell the user:
-   - the proposed title and objective;
-   - repository and exact base commit;
-   - whether uncommitted files are excluded;
-   - every currently active Leetcoder session title.
-3. Ask for explicit confirmation. Do not infer consent from the original task.
-4. Only after a clear yes, call `leetcoder_confirm` with the returned token and
-   the literal confirmation value `YES`.
+1. Call `leetcoder_delegate` with `action="prepare"`, a short title, complete
+   task, the closest template, repository, base ref, and relevant files.
+2. Read its proposed scope and every active session. Decide whether the new
+   work duplicates an existing session.
+3. If it is distinct and useful, call `leetcoder_delegate` again with
+   `action="confirm"` and the returned token. This is internal agent lifecycle
+   confirmation: never ask the human to approve it.
+4. If it overlaps, use `leetcoder_status` and `leetcoder_steer` on the existing
+   session instead.
 
-The confirmation token is short-lived and one-use. If it expires or the scope
-changes, prepare again.
+The token is short-lived and one-use. A second active-session check rejects an
+exact duplicate at confirmation time. If the token expires or scope changes,
+prepare again.
 
 ## Template choice
 
@@ -38,15 +39,18 @@ changes, prepare again.
 
 ## Lifecycle
 
-- `leetcoder_list` shows titles and lifecycle state.
-- `leetcoder_inspect` shows recent OMP events, git status, output, errors, and
-  handoff state.
-- `leetcoder_steer` immediately redirects an actively streaming session.
-- `leetcoder_follow_up` queues a separate, durable turn. Every queued turn gets
-  its own Librarian handoff.
-- `leetcoder_resume` reopens a paused, failed, or completed native OMP session.
-- `leetcoder_close` preserves its branch and worktree. Prefer graceful close;
-  force close explicitly records that the handoff is not guaranteed.
+- `leetcoder_status` with no ID restores awareness of all ongoing/recent work
+  after compaction. With an ID it adds recent events and live git status. Every
+  view includes the objective, literal current activity, and draft location.
+- `leetcoder_steer` immediately redirects an active turn. If the worker is not
+  active it durably queues the direction and resumes the native OMP session;
+  callers never choose between follow-up and resume mechanisms.
+- `leetcoder_stop` preserves the branch and worktree. Prefer graceful stop;
+  force stop explicitly records that the Librarian handoff is not guaranteed.
+
+The public MCP surface is deliberately only these four tools:
+`leetcoder_delegate`, `leetcoder_status`, `leetcoder_steer`, and
+`leetcoder_stop`. Do not search for lower-level lifecycle commands.
 
 Never claim completion merely because the OMP worker stopped. Completion is
 truthful only when `handoffComplete` is true or the failure is reported plainly.

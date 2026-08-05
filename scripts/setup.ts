@@ -68,9 +68,9 @@ Leetcoder is installed.
   Hermes MCP:     leetcoder
   Service:        leetcoder.service
 
-Use bun run doctor for a concise lifecycle check. Hermes must call
-leetcoder_delegate before leetcoder_confirm; no OMP task starts without the
-explicit second call.
+  Use bun run doctor for a concise lifecycle check. Hermes must call
+  leetcoder_delegate with action=prepare before action=confirm; no OMP task
+  starts without the agent's explicit second call.
 `);
 
 function configureOmpProfile(): void {
@@ -84,7 +84,7 @@ function configureOmpProfile(): void {
 
   const parsed = parse(readFileSync(sourceConfig, "utf8")) as unknown;
   if (!isRecord(parsed)) fail(`OMP config is not a mapping: ${sourceConfig}`);
-  parsed.advisor = { ...record(parsed.advisor), enabled: false, subagents: false };
+  parsed.advisor = { ...record(parsed.advisor), enabled: true, subagents: false, syncBacklog: "1" };
   parsed.memory = { ...record(parsed.memory), backend: "off" };
   parsed.task = {
     ...record(parsed.task),
@@ -107,6 +107,8 @@ function configureOmpProfile(): void {
   writeFileSync(path.join(target, "mcp.json"), `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
   copyFileSync(sourceModels, path.join(target, "models.yml"));
   chmodSync(path.join(target, "models.yml"), 0o600);
+  copyFileSync(path.join(root, "rules", "advisor.md"), path.join(target, "WATCHDOG.md"));
+  chmodSync(path.join(target, "WATCHDOG.md"), 0o600);
 }
 
 function writeEnv(): void {

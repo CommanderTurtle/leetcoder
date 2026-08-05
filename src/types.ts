@@ -125,6 +125,7 @@ export interface OmpWorkerOptions {
   provider?: string | null;
   model?: string | null;
   thinking?: ThinkingLevel | null;
+  advisor: boolean;
   onSession: (path: string, id: string) => void;
   onEvent: (event: JsonObject) => void;
   onUiRequest: (request: JsonObject) => Promise<JsonObject>;

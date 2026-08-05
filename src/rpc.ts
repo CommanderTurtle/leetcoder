@@ -57,6 +57,7 @@ export class OmpRpcWorker {
 
     const args: string[] = [];
     if (options.profile.trim() && options.profile !== "default") args.push("--profile", options.profile);
+    if (options.advisor) args.push("--advisor");
     args.push(
       "--mode", "rpc",
       "--approval-mode", "yolo",

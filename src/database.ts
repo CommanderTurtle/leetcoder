@@ -150,6 +150,12 @@ export class LeetcoderDatabase {
     `).all() as Row[]).map(mapSession);
   }
 
+  pausedSessions(): SessionRecord[] {
+    return (this.db.query(`
+      SELECT * FROM sessions WHERE status = 'paused' ORDER BY updated_at ASC
+    `).all() as Row[]).map(mapSession);
+  }
+
   countExecuting(): number {
     const row = this.db.query(`
       SELECT count(*) AS value FROM sessions

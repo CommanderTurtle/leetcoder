@@ -9,113 +9,87 @@ const server = new McpServer(
   { name: "leetcoder", version: "0.1.0" },
   {
     instructions:
-      "Leetcoder delegates bounded work from Hermes to isolated, persistent OMP coding sessions. " +
-      "Always call leetcoder_delegate first. It starts nothing: show its active-session list and proposal to the user, " +
-      "then call leetcoder_confirm only after an explicit yes. Monitor with list/inspect, steer active work, and close deliberately."
+      "Leetcoder is Hermes' autonomous control pane for persistent, worktree-isolated OMP sessions. " +
+      "Use only its four tools. Prepare with leetcoder_delegate action='prepare'; inspect the returned active sessions yourself, " +
+      "then call the same tool with action='confirm' and its token when the work is not a duplicate. Never ask the human to confirm this internal delegation. " +
+      "Use leetcoder_status after compaction or whenever ongoing work is uncertain; it always returns objective, current activity, and draft location."
   }
 );
 
 server.registerTool(
   "leetcoder_delegate",
   {
-    title: "Prepare an OMP delegation",
+    title: "Prepare or confirm an OMP delegation",
     description:
-      "Prepare—but do not start—a bounded OMP task. Returns the proposed work, all active Leetcoder session titles, and a short-lived confirmation token. You MUST show those details and obtain an explicit user confirmation before calling leetcoder_confirm.",
+      "Two-stage autonomous delegation. First use action='prepare' with the task: nothing starts, and the result shows every active session plus a one-use token. Check for duplicate work yourself. Then use action='confirm' with only that token. Do not ask the human for confirmation.",
     inputSchema: {
-      title: z.string().min(1).max(120).describe("Short title visible only to the parent Hermes session"),
-      task: z.string().min(1).max(50_000).describe("Complete objective, constraints, acceptance criteria, and relevant context"),
-      template: z.enum(["implementation", "bugfix", "audit", "refactor", "tests", "research", "web", "comparison"]),
+      action: z.enum(["prepare", "confirm"]),
+      confirmationToken: z.string().uuid().optional().describe("Required only for action='confirm'; use the token from the immediately preceding prepare response"),
+      title: z.string().min(1).max(120).optional().describe("Required for prepare: compact title visible to Hermes"),
+      task: z.string().min(1).max(50_000).optional().describe("Required for prepare: complete objective, constraints, acceptance criteria, and context"),
+      template: z.enum(["implementation", "bugfix", "audit", "refactor", "tests", "research", "web", "comparison"]).optional(),
       repository: z.string().optional().describe("Absolute or home-relative local git checkout. Omit for a standalone research workspace."),
       baseRef: z.string().optional().describe("Git commit-ish to isolate; defaults to HEAD. Uncommitted source-checkout changes are intentionally excluded."),
       files: z.array(z.string()).max(200).optional().describe("Explicit files or areas that define the intended scope"),
     },
   },
-  async (input) => text(await client.call("/v1/delegate", input))
+  async (input) => {
+    if (input.action === "confirm") {
+      if (!input.confirmationToken) throw new Error("action='confirm' requires confirmationToken");
+      return text(await client.call("/v1/confirm", { token: input.confirmationToken }));
+    }
+    if (input.confirmationToken) throw new Error("action='prepare' does not accept confirmationToken");
+    if (!input.title || !input.task || !input.template) {
+      throw new Error("action='prepare' requires title, task, and template");
+    }
+    return text(await client.call("/v1/delegate", {
+      title: input.title,
+      task: input.task,
+      template: input.template,
+      ...(input.repository ? { repository: input.repository } : {}),
+      ...(input.baseRef ? { baseRef: input.baseRef } : {}),
+      ...(input.files ? { files: input.files } : {}),
+    }));
+  }
 );
 
 server.registerTool(
-  "leetcoder_confirm",
+  "leetcoder_status",
   {
-    title: "Confirm and start an OMP delegation",
+    title: "Status of OMP delegations",
     description:
-      "Start a previously prepared delegation. Call only after the human explicitly confirms the exact proposal. confirmation must be the literal string YES; never infer or manufacture consent.",
+      "Recover Leetcoder awareness after compaction or monitor work. With no sessionId, lists active/recent sessions. With sessionId, returns detailed events and git status. Every result includes the objective, literal current activity, and draft worktree/directory.",
     inputSchema: {
-      confirmationToken: z.string().uuid(),
-      confirmation: z.literal("YES"),
-    },
-  },
-  async ({ confirmationToken, confirmation }) => text(await client.call("/v1/confirm", { token: confirmationToken, confirmation }))
-);
-
-server.registerTool(
-  "leetcoder_list",
-  {
-    title: "List Leetcoder sessions",
-    description: "List persistent OMP delegations, their human titles, lifecycle states, worktrees, branches, and queued follow-ups.",
-    inputSchema: {
+      sessionId: z.string().min(1).optional(),
       includeClosed: z.boolean().default(false),
-      limit: z.number().int().min(1).max(200).default(100),
-    },
-  },
-  async ({ includeClosed, limit }) => text(await client.call("/v1/list", { includeClosed, limit }))
-);
-
-server.registerTool(
-  "leetcoder_inspect",
-  {
-    title: "Inspect a Leetcoder session",
-    description: "Inspect one session's task, OMP lifecycle, recent tool/output events, current git status, branch, worktree, errors, and Librarian handoff state.",
-    inputSchema: {
-      sessionId: z.string().min(1),
       eventLimit: z.number().int().min(1).max(200).default(40),
     },
   },
-  async ({ sessionId, eventLimit }) => text(await client.call("/v1/inspect", { sessionId, eventLimit }))
+  async ({ sessionId, includeClosed, eventLimit }) => text(
+    sessionId
+      ? await client.call("/v1/inspect", { sessionId, eventLimit })
+      : await client.call("/v1/list", { includeClosed, limit: 100 })
+  )
 );
 
 server.registerTool(
   "leetcoder_steer",
   {
     title: "Steer active OMP work",
-    description: "Inject immediate direction into an actively streaming Leetcoder OMP session. Use follow_up for a separate turn after the current work.",
+    description:
+      "Give an existing delegation new direction. It steers a live OMP turn immediately; otherwise it durably queues a follow-up and automatically resumes the saved OMP session. The caller never chooses between steer/follow-up/resume plumbing.",
     inputSchema: {
       sessionId: z.string().min(1),
       message: z.string().min(1).max(20_000),
     },
   },
-  async ({ sessionId, message }) => text(await client.call("/v1/steer", { sessionId, message }))
+  async ({ sessionId, message }) => text(await client.call("/v1/direction", { sessionId, message }))
 );
 
 server.registerTool(
-  "leetcoder_follow_up",
+  "leetcoder_stop",
   {
-    title: "Queue an OMP follow-up",
-    description: "Queue a durable follow-up turn for an existing session. It runs serially after current work and receives its own mandatory Librarian handoff.",
-    inputSchema: {
-      sessionId: z.string().min(1),
-      message: z.string().min(1).max(50_000),
-    },
-  },
-  async ({ sessionId, message }) => text(await client.call("/v1/follow-up", { sessionId, message }))
-);
-
-server.registerTool(
-  "leetcoder_resume",
-  {
-    title: "Resume a persisted OMP session",
-    description: "Reopen a paused, failed, or completed OMP session from its native saved session and queue a recovery turn against the preserved worktree.",
-    inputSchema: {
-      sessionId: z.string().min(1),
-      message: z.string().max(20_000).optional(),
-    },
-  },
-  async ({ sessionId, message }) => text(await client.call("/v1/resume", { sessionId, ...(message ? { message } : {}) }))
-);
-
-server.registerTool(
-  "leetcoder_close",
-  {
-    title: "Close a Leetcoder session",
+    title: "Stop a Leetcoder session",
     description:
       "Close a persistent session while preserving its branch and worktree. Graceful close steers to a safe boundary and requires the Librarian handoff. Force close aborts immediately and records that the handoff is not guaranteed.",
     inputSchema: {

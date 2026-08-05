@@ -4,32 +4,35 @@ Leetcoder lets a live Hermes agent hand a bounded job to a native
 [oh-my-pi](https://github.com/can1357/oh-my-pi) session without surrendering
 control of the conversation. Each delegation gets an isolated git worktree,
 its own persistent OMP session, a visible title, live steering, durable
-follow-ups, and a mandatory Librarian handoff.
+follow-ups, native Advisor review, and a mandatory Librarian handoff.
 
-Nothing starts on the first tool call. Hermes first shows the proposed scope
-and every active Leetcoder title; the user must explicitly confirm the second
-call.
+Nothing starts on the first tool call. Hermes receives the proposed scope and
+every active Leetcoder title, checks for duplicate work itself, and confirms on
+the second call. This is agent lifecycle control, not a human permission prompt.
 
 ```mermaid
 flowchart LR
   H["Hermes conversation"] -->|"delegate proposal"| M["Leetcoder MCP"]
   M -->|"active titles + confirmation token"| H
-  H -->|"explicit YES"| G["Leetcoder gateway"]
+  H -->|"agent confirms no duplicate"| G["Leetcoder gateway"]
   G --> W["isolated git worktree"]
   G --> O["persistent OMP RPC session"]
+  O --> A["native read-only Advisor"]
   O --> F["Firecrawl / Camofox / Retrieval / Codebase Memory"]
   O -->|"mandatory memory_add"| L["Librarian OKF handoff"]
 ```
 
 ## What it owns
 
-- two-stage, one-use confirmation before a task begins;
-- up to three concurrent root workers by default, each with one OMP-native
-  task slot; together with Hermes and Librarian this respects an eight-sequence
-  local model ceiling;
+- two-stage, one-use agent confirmation before a task begins, with an exact
+  duplicate check at confirmation time;
+- up to three concurrent root workers by default, each continuously reviewed by
+  OMP's native Advisor; three worker/Advisor pairs plus Hermes and Librarian fit
+  the configured eight-sequence local model ceiling;
 - native OMP protocol v2 sessions, steering, follow-ups, and resumption;
 - one git branch and worktree per delegation, preserved after completion;
 - SQLite lifecycle and event history under `~/.local/share/leetcoder`;
+- automatic recovery of interrupted turns after a service restart;
 - graceful and force-close semantics with truthful handoff status;
 - a required `mcp__librarian_memory_add` OKF handoff after every completed
   implementation or follow-up turn.
@@ -73,14 +76,10 @@ The generated paths are deliberately outside git:
 
 | Tool | Contract |
 |---|---|
-| `leetcoder_delegate` | Prepare scope and report active sessions; starts nothing. |
-| `leetcoder_confirm` | Consume explicit confirmation and start background work. |
-| `leetcoder_list` | List persistent sessions and queued follow-ups. |
-| `leetcoder_inspect` | Show lifecycle, recent OMP events, git state, and handoff truth. |
-| `leetcoder_steer` | Inject immediate direction into active work. |
-| `leetcoder_follow_up` | Queue a serial, persistent turn with its own handoff. |
-| `leetcoder_resume` | Reopen a native saved OMP session after pause or completion. |
-| `leetcoder_close` | Close while preserving branch/worktree; graceful by default. |
+| `leetcoder_delegate` | `prepare` reports scope and active sessions; `confirm` starts the non-duplicate task with the returned token. |
+| `leetcoder_status` | Restore awareness after compaction or inspect one session, always including objective, current activity, and draft location. |
+| `leetcoder_steer` | Steer live work immediately or durably resume/queue direction behind the same simple call. |
+| `leetcoder_stop` | Stop while preserving branch/worktree; graceful by default. |
 
 Templates cover implementation, bug fixes, audits, refactors, tests, research,
 interactive web work, and source comparisons. They provide execution shape,
@@ -96,10 +95,17 @@ bun dist/cli.js service status
 bun dist/cli.js service restart
 ```
 
-An interrupted gateway marks in-flight sessions `paused` and preserves their
-OMP session path. `leetcoder_resume` continues from that native history after
-re-reading the worktree. Follow-up messages are stored before execution and
-survive service restarts.
+An interrupted gateway marks in-flight sessions `paused`, preserves their OMP
+session path, and automatically queues a recovery turn after restart. Steering
+and follow-up messages are stored before deferred execution and survive service
+restarts. `leetcoder_status` reconstructs the whole control view after Hermes
+compaction from SQLite rather than relying on conversation memory.
+
+The Leetcoder profile enables OMP's native Advisor at the persisted profile and
+every headless RPC launch. The runtime flag matters because OMP intentionally
+resets workflow-altering Advisor/task/memory settings to safe defaults in RPC
+mode. Advisor subagents remain disabled: each root worker gets one passive,
+read-only reviewer rather than an uncontrolled review tree.
 
 Closing never deletes a branch or worktree. Review, merge, archive, or remove
 them explicitly with ordinary git commands after the parent Hermes session has

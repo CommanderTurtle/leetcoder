@@ -28,9 +28,9 @@ export class LeetcoderOrchestrator {
     validatePrepare(request);
     const repository = inspectRepository(request.repository, request.baseRef || "HEAD");
     const pending = this.db.createPending(request, repository, this.config.confirmation.ttlMinutes);
-    const active = this.db.activeSessions().map(sessionSummary);
+    const active = this.db.activeSessions().map((session) => this.sessionView(session));
     return {
-      confirmationRequired: true,
+      agentConfirmationRequired: true,
       confirmationToken: pending.token,
       expiresAt: new Date(pending.expiresAt).toISOString(),
       proposed: {
@@ -45,16 +45,21 @@ export class LeetcoderOrchestrator {
       },
       activeSessions: active,
       instruction:
-        "Show this proposal and the active-session titles to the user. Start nothing until the user explicitly confirms; then call leetcoder_confirm with this token and confirmation='YES'.",
+        "Review the active sessions yourself for duplicate work. Do not ask the human to confirm. If this delegation is still warranted, call leetcoder_delegate again with action='confirm' and this confirmationToken.",
     };
   }
 
-  confirm(token: string, confirmation: string): JsonObject {
-    if (confirmation !== "YES") throw new Error("Leetcoder requires the exact confirmation value YES");
+  confirm(token: string): JsonObject {
     if (this.db.countExecuting() >= this.config.omp.maxWorkers) {
       throw new Error(`All ${this.config.omp.maxWorkers} Leetcoder worker slots are active; close or await one before confirming another delegation`);
     }
     const pending = this.db.consumePending(token);
+    const duplicate = this.db.activeSessions().find((session) =>
+      sameDelegation(session, pending.title, pending.task, pending.repositoryRoot)
+    );
+    if (duplicate) {
+      throw new Error(`Delegation duplicates active session ${duplicate.id} (${duplicate.title}); inspect or steer that session instead`);
+    }
     const workspace = createWorkspace(this.config.paths.dataRoot, pending);
     const session = this.db.createSession(pending, workspace);
     this.db.addEvent(session.id, "delegation_confirmed", {
@@ -66,68 +71,47 @@ export class LeetcoderOrchestrator {
     void this.runManagedTurn(session.id, initialPrompt(session), "initial");
     return {
       started: true,
-      session: sessionSummary(session),
-      worktree: session.worktree,
-      branch: session.branch,
-      note: "The OMP session is running in the background. Use leetcoder_inspect or leetcoder_list; use leetcoder_steer to alter active work.",
+      session: this.sessionView(session),
+      note: "The autonomous OMP session is running. Use leetcoder_status to observe it or leetcoder_steer to redirect it.",
     };
   }
 
   list(includeClosed = false, limit = 100): JsonObject {
     const sessions = this.db.listSessions(limit)
       .filter((session) => includeClosed || session.status !== "closed")
-      .map((session) => ({ ...sessionSummary(session), queuedFollowUps: this.db.queuedFollowUpCount(session.id) }));
+      .map((session) => this.sessionView(session));
     return { sessions, workerProcesses: this.workers.size };
   }
 
   inspect(id: string, eventLimit = 40): JsonObject {
     const session = this.db.getSession(id);
-    return {
-      session,
-      queuedFollowUps: this.db.queuedFollowUpCount(id),
-      worktreeStatus: gitStatus(session.worktree),
-      events: this.db.events(id, eventLimit),
-    };
+    return this.sessionView(session, true, eventLimit);
   }
 
-  async steer(id: string, message: string): Promise<JsonObject> {
+  async direction(id: string, message: string): Promise<JsonObject> {
     const session = this.db.getSession(id);
-    if (!message.trim()) throw new Error("Steering message cannot be empty");
-    if (!new Set(["starting", "running", "handoff", "closing"]).has(session.status)) {
-      throw new Error(`Session ${id} is ${session.status}, not actively streaming. Use leetcoder_follow_up or leetcoder_resume.`);
-    }
+    const direction = message.trim();
+    if (!direction) throw new Error("Steering message cannot be empty");
+    if (session.status === "closed") throw new Error("A closed Leetcoder session cannot accept direction; delegate a new session instead");
     const worker = this.workers.get(id);
-    if (!worker?.isAlive) throw new Error(`Session ${id} has no live worker. Use leetcoder_resume to reopen its saved OMP session.`);
-    await worker.steer(message.trim());
-    this.db.addEvent(id, "hermes_steer", { message: message.trim() });
-    return { accepted: true, session: id, status: this.db.getSession(id).status };
-  }
+    if (isExecuting(session.status) && worker?.isAlive) {
+      await worker.steer(direction);
+      this.db.addEvent(id, "hermes_steer", { message: direction });
+      return { accepted: true, mode: "immediate-steer", session: this.sessionView(this.db.getSession(id)) };
+    }
 
-  followUp(id: string, message: string): JsonObject {
-    const session = this.db.getSession(id);
-    if (!message.trim()) throw new Error("Follow-up message cannot be empty");
-    if (session.status === "closed") throw new Error("A closed Leetcoder session cannot accept follow-ups; delegate a new session instead");
-    const queueId = this.db.enqueueFollowUp(id, message.trim());
-    this.db.addEvent(id, "hermes_follow_up_queued", { queueId, message: message.trim() });
+    const prompt = new Set(["paused", "failed", "completed"]).has(session.status)
+      ? recoveryPrompt(session, direction)
+      : direction;
+    const queueId = this.db.enqueueFollowUp(id, prompt);
+    this.db.addEvent(id, "hermes_direction_queued", { queueId, message: direction, priorStatus: session.status });
     if (!isExecuting(session.status)) this.scheduleDrain(id);
     return {
-      queued: true,
+      accepted: true,
+      mode: "durable-follow-up",
       queueId,
-      session: id,
-      ahead: this.db.queuedFollowUpCount(id) - 1,
-      note: "Each follow-up is its own OMP turn and receives a fresh mandatory Librarian handoff.",
+      session: this.sessionView(this.db.getSession(id)),
     };
-  }
-
-  resume(id: string, message?: string): JsonObject {
-    const session = this.db.getSession(id);
-    if (session.status === "closed") throw new Error("A closed Leetcoder session cannot be resumed");
-    if (isExecuting(session.status)) throw new Error(`Session ${id} is already ${session.status}`);
-    if (!session.sessionPath) throw new Error("This session never reached a persisted OMP session and cannot be resumed");
-    const queueId = this.db.enqueueFollowUp(id, recoveryPrompt(session, message?.trim()));
-    this.db.addEvent(id, "resume_queued", { queueId, message: message?.trim() || null });
-    this.scheduleDrain(id);
-    return { queued: true, queueId, session: id, priorStatus: session.status };
   }
 
   async closeSession(id: string, force: boolean): Promise<JsonObject> {
@@ -161,6 +145,12 @@ export class LeetcoderOrchestrator {
   }
 
   resumeQueuedWork(): void {
+    for (const session of this.db.pausedSessions()) {
+      if (this.db.queuedFollowUpCount(session.id) === 0) {
+        const queueId = this.db.enqueueFollowUp(session.id, recoveryPrompt(session));
+        this.db.addEvent(session.id, "automatic_recovery_queued", { queueId, priorPhase: session.phase });
+      }
+    }
     for (const id of this.db.sessionsWithQueuedFollowUps()) this.scheduleDrain(id);
   }
 
@@ -172,8 +162,47 @@ export class LeetcoderOrchestrator {
       executing: this.db.countExecuting(),
       maxWorkers: this.config.omp.maxWorkers,
       profile: this.config.omp.profile,
+      advisor: true,
       dataRoot: this.config.paths.dataRoot,
     };
+  }
+
+  private sessionView(session: SessionRecord, detailed = false, eventLimit = 40): JsonObject {
+    const events = this.db.events(session.id, detailed ? eventLimit : 1);
+    const latest = events.at(-1);
+    const view: JsonObject = {
+      id: session.id,
+      title: session.title,
+      objective: truncate(session.task, detailed ? 8_000 : 1_000),
+      template: session.template,
+      status: session.status,
+      phase: session.phase,
+      currentActivity: activitySummary(session, latest),
+      draft: {
+        kind: session.sourceRepo ? "git-worktree" : "standalone-directory",
+        directory: session.worktree,
+        branch: session.branch,
+        sourceRepository: session.sourceRepo,
+        baseRef: session.baseRef,
+        baseCommit: session.baseCommit,
+      },
+      queuedDirections: this.db.queuedFollowUpCount(session.id),
+      lastOutputSummary: truncate(session.lastOutput, detailed ? 8_000 : 1_000),
+      lastError: session.lastError,
+      librarianHandoff: {
+        complete: session.handoffComplete,
+        suggestedPath: session.handoffSuggestedPath,
+      },
+      ompSessionPath: session.sessionPath,
+      createdAt: new Date(session.createdAt).toISOString(),
+      updatedAt: new Date(session.updatedAt).toISOString(),
+    };
+    if (detailed) {
+      view.requestedFiles = session.files;
+      view.worktreeStatus = gitStatus(session.worktree);
+      view.events = events;
+    }
+    return view;
   }
 
   async close(): Promise<void> {
@@ -273,6 +302,7 @@ export class LeetcoderOrchestrator {
       profile: this.config.omp.profile,
       cwd: session.worktree,
       systemPromptPath: systemPromptPath(),
+      advisor: true,
       ...(session.sessionPath ? { sessionPath: session.sessionPath } : {}),
       ...(this.config.omp.provider ? { provider: this.config.omp.provider } : {}),
       ...(this.config.omp.model ? { model: this.config.omp.model } : {}),
@@ -331,20 +361,6 @@ function validatePrepare(request: PrepareRequest): void {
   if ((request.files || []).length > 200) throw new Error("A delegation may name at most 200 files or areas");
 }
 
-function sessionSummary(session: SessionRecord): JsonObject {
-  return {
-    id: session.id,
-    title: session.title,
-    template: session.template,
-    status: session.status,
-    phase: session.phase,
-    branch: session.branch,
-    worktree: session.worktree,
-    updatedAt: new Date(session.updatedAt).toISOString(),
-    handoffComplete: session.handoffComplete,
-  };
-}
-
 function isExecuting(status: string): boolean {
   return new Set(["starting", "running", "handoff", "closing"]).has(status);
 }
@@ -384,4 +400,57 @@ function gitStatus(worktree: string): JsonObject {
 
 function truncate(value: string, maximum: number): string {
   return value.length <= maximum ? value : `${value.slice(0, maximum)}\n…[truncated]`;
+}
+
+function sameDelegation(session: SessionRecord, title: string, task: string, sourceRepo: string | null): boolean {
+  return normalize(session.task) === normalize(task)
+    || (normalize(session.title) === normalize(title) && session.sourceRepo === sourceRepo);
+}
+
+function normalize(value: string): string {
+  return value.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function activitySummary(session: SessionRecord, latest: { kind: string; body: JsonObject } | undefined): string {
+  if (latest) {
+    const tool = typeof latest.body.toolName === "string" ? latest.body.toolName : "";
+    const progress = firstText(latest.body.progress, latest.body.message, latest.body.text);
+    switch (latest.kind) {
+      case "tool_execution_start":
+        return `Running ${tool || "an OMP tool"}${progress ? `: ${truncate(progress, 300)}` : ""}`;
+      case "tool_execution_end":
+        return `Finished ${tool || "an OMP tool"}; continuing the ${session.phase} phase`;
+      case "subagent_lifecycle":
+      case "subagent_progress":
+        return progress ? truncate(progress, 400) : `OMP subagent activity during ${session.phase}`;
+      case "turn_started":
+        return `OMP is working on the ${session.phase} phase`;
+      case "turn_finished":
+        return "Implementation turn finished; preparing the durable Librarian handoff";
+      case "handoff_retry":
+        return "Retrying the mandatory Librarian handoff";
+      case "handoff_complete":
+        return "Durable Librarian handoff completed";
+      case "worker_stderr":
+        return progress ? `OMP runtime: ${truncate(progress, 300)}` : "OMP runtime emitted a diagnostic";
+      case "turn_failed":
+        return progress ? `Failed: ${truncate(progress, 300)}` : "The OMP turn failed";
+    }
+  }
+  const fallback: Record<string, string> = {
+    starting: "Preparing the isolated OMP worktree and session",
+    running: `OMP is working on the ${session.phase} phase`,
+    handoff: "Writing the mandatory Librarian OKF handoff",
+    completed: "Work and Librarian handoff are complete; draft remains available",
+    failed: `Work stopped with an error${session.lastError ? `: ${truncate(session.lastError, 300)}` : ""}`,
+    paused: "Saved OMP session is queued for automatic recovery",
+    closing: "Stopping at a safe boundary before the final handoff",
+    closed: "Session is closed; its draft worktree is preserved",
+  };
+  return fallback[session.status] || `${session.status}: ${session.phase}`;
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) if (typeof value === "string" && value.trim()) return value.trim();
+  return "";
 }

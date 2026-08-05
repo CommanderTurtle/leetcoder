@@ -23,17 +23,13 @@ export async function serve(config: LeetcoderConfig): Promise<void> {
           case "/v1/delegate":
             return json(orchestrator.prepare(body as unknown as PrepareRequest));
           case "/v1/confirm":
-            return json(orchestrator.confirm(string(body.token), string(body.confirmation)));
+            return json(orchestrator.confirm(string(body.token)));
           case "/v1/list":
             return json(orchestrator.list(boolean(body.includeClosed), integer(body.limit, 100)));
           case "/v1/inspect":
             return json(orchestrator.inspect(string(body.sessionId), integer(body.eventLimit, 40)));
-          case "/v1/steer":
-            return json(await orchestrator.steer(string(body.sessionId), string(body.message)));
-          case "/v1/follow-up":
-            return json(orchestrator.followUp(string(body.sessionId), string(body.message)));
-          case "/v1/resume":
-            return json(orchestrator.resume(string(body.sessionId), optionalString(body.message)));
+          case "/v1/direction":
+            return json(await orchestrator.direction(string(body.sessionId), string(body.message)));
           case "/v1/close":
             return json(await orchestrator.closeSession(string(body.sessionId), boolean(body.force)));
           default:
@@ -86,10 +82,6 @@ function json(value: unknown, status = 200): Response {
 function string(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("A required string field is missing");
   return value.trim();
-}
-
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function boolean(value: unknown): boolean {
