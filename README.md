@@ -116,7 +116,9 @@ automatically queues a recovery turn after restart. Steering and follow-up
 messages are stored before deferred execution and survive service restarts.
 `leetcoder_status` refreshes the live OMP registry through RPC, reads child
 transcripts incrementally, and reconstructs the complete control view after
-Hermes compaction from SQLite rather than relying on conversation memory.
+Hermes compaction from SQLite rather than relying on conversation memory. A
+detailed session inspection also reports the live root's model, streaming and
+compaction state, queued messages, todos, throughput, and context utilization.
 
 The Leetcoder profile enables OMP's native Advisor at the persisted profile and
 every headless RPC launch. The runtime flag matters because OMP intentionally
@@ -124,8 +126,10 @@ resets workflow-altering Advisor/task/memory settings to safe defaults in RPC
 mode. Advisor subagents remain disabled: each root worker gets one passive,
 read-only reviewer rather than an uncontrolled review tree. Native task
 recursion remains one level and concurrency remains one child per root by
-default, fitting three root/Advisor pairs, Hermes, and Librarian inside the
-configured eight-sequence local model ceiling.
+default. Inner async execution is disabled because Leetcoder itself already
+runs the root in the background; a child therefore replaces rather than
+overlaps its parent's generation slot. This keeps three root/Advisor pairs,
+Hermes, and Librarian inside the configured eight-sequence local model ceiling.
 
 Closing never deletes a branch or worktree. Review, merge, archive, or remove
 them explicitly with ordinary git commands after the parent Hermes session has

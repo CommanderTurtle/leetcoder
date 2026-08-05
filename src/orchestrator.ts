@@ -95,7 +95,8 @@ export class LeetcoderOrchestrator {
 
   async inspect(id: string, eventLimit = 40): Promise<JsonObject> {
     await this.syncSwarmState(id, true);
-    return this.sessionView(this.db.getSession(id), true, eventLimit);
+    const rootRuntime = await this.liveRootState(id);
+    return this.sessionView(this.db.getSession(id), true, eventLimit, rootRuntime);
   }
 
   async direction(id: string, message: string): Promise<JsonObject> {
@@ -186,7 +187,7 @@ export class LeetcoderOrchestrator {
     };
   }
 
-  private sessionView(session: SessionRecord, detailed = false, eventLimit = 40): JsonObject {
+  private sessionView(session: SessionRecord, detailed = false, eventLimit = 40, rootRuntime?: JsonObject): JsonObject {
     const events = this.db.events(session.id, detailed ? eventLimit : 1);
     const latest = events.at(-1);
     const subagents = this.db.subagents(session.id);
@@ -221,9 +222,24 @@ export class LeetcoderOrchestrator {
     if (detailed) {
       view.requestedFiles = session.files;
       view.worktreeStatus = gitStatus(session.worktree);
+      view.rootRuntime = rootRuntime ?? { available: false, status: "not-requested" };
       view.events = events;
     }
     return view;
+  }
+
+  private async liveRootState(id: string): Promise<JsonObject> {
+    const worker = this.workers.get(id);
+    if (!worker?.isAlive) return { available: false, status: "stopped" };
+    try {
+      return { available: true, status: "live", pid: worker.pid, ...compactRootRuntime(await worker.getState()) };
+    } catch (error) {
+      return {
+        available: false,
+        status: "unavailable",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   async close(): Promise<void> {
@@ -536,6 +552,16 @@ function compactProgress(progress: JsonObject): JsonObject {
     copy.recentOutput = progress.recentOutput.slice(-8).map((item) => typeof item === "string" ? truncate(item, 2_000) : item);
   }
   return copy;
+}
+
+function compactRootRuntime(state: JsonObject): JsonObject {
+  const view: JsonObject = {};
+  for (const key of [
+    "model", "thinkingLevel", "isStreaming", "isCompacting", "steeringMode", "followUpMode",
+    "interruptMode", "sessionId", "sessionName", "messageCount", "queuedMessageCount",
+    "tokensPerSecond", "contextUsage", "todoPhases",
+  ]) if (key in state) view[key] = state[key];
+  return view;
 }
 
 function transcriptMessages(messages: JsonObject[]): JsonObject[] {

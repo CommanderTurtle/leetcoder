@@ -85,6 +85,7 @@ function configureOmpProfile(): void {
   const parsed = parse(readFileSync(sourceConfig, "utf8")) as unknown;
   if (!isRecord(parsed)) fail(`OMP config is not a mapping: ${sourceConfig}`);
   parsed.advisor = { ...record(parsed.advisor), enabled: true, subagents: false, syncBacklog: "1" };
+  parsed.async = { ...record(parsed.async), enabled: false };
   parsed.memory = { ...record(parsed.memory), backend: "off" };
   parsed.task = {
     ...record(parsed.task),
