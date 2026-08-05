@@ -1,7 +1,7 @@
 {
   "name": "@commanderturtle/leetcoder",
   "version": "0.1.0",
-  "description": "Confirmation-gated Hermes delegation to persistent, isolated oh-my-pi coding sessions",
+  "description": "Autonomous Hermes delegation to persistent, Advisor-reviewed oh-my-pi worktree sessions",
   "type": "module",
   "license": "AGPL-3.0-only",
   "author": "CommanderTurtle",
@@ -36,7 +36,7 @@
     "bun": ">=1.3.14"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
@@ -54,5 +54,10 @@
     "leetcoder.config.example.json",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "overrides": {
+    "@hono/node-server": ">=2.0.5",
+    "fast-uri": ">=3.1.5",
+    "hono": ">=4.12.34"
+  }
 }
