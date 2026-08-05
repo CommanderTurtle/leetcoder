@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Confirmation-gated Hermes delegation to persistent, isolated oh-my-pi coding sessions",
   "type": "module",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "author": "CommanderTurtle",
   "repository": {
     "type": "git",
