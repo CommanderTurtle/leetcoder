@@ -8,6 +8,9 @@ import type {
   SessionEvent,
   SessionRecord,
   SessionStatus,
+  OmpSubagentSnapshot,
+  SubagentRecord,
+  SubagentStatus,
   TaskTemplate,
   WorkspaceInfo,
 } from "./types.ts";
@@ -290,6 +293,107 @@ export class LeetcoderDatabase {
     }));
   }
 
+  upsertSubagent(sessionId: string, snapshot: OmpSubagentSnapshot): void {
+    const now = Date.now();
+    const lastUpdate = Number.isFinite(snapshot.lastUpdate) && snapshot.lastUpdate > 0 ? snapshot.lastUpdate : now;
+    const completedAt = isTerminalSubagentStatus(snapshot.status) ? now : null;
+    const progress = limitEvent(snapshot.progress);
+    this.db.query(`
+      INSERT INTO subagents (
+        session_id, subagent_id, index_number, agent, agent_source, description,
+        task, assignment, status, session_file, parent_tool_call_id,
+        progress_json, transcript_offset, transcript_json, omp_last_update,
+        created_at, updated_at, completed_at
+      ) VALUES (
+        $sessionId, $subagentId, $indexNumber, $agent, $agentSource, $description,
+        $task, $assignment, $status, $sessionFile, $parentToolCallId,
+        $progressJson, 0, '[]', $lastUpdate, $now, $now, $completedAt
+      )
+      ON CONFLICT(session_id, subagent_id) DO UPDATE SET
+        index_number = excluded.index_number,
+        agent = excluded.agent,
+        agent_source = excluded.agent_source,
+        description = COALESCE(excluded.description, subagents.description),
+        task = COALESCE(excluded.task, subagents.task),
+        assignment = COALESCE(excluded.assignment, subagents.assignment),
+        status = excluded.status,
+        session_file = COALESCE(excluded.session_file, subagents.session_file),
+        parent_tool_call_id = COALESCE(excluded.parent_tool_call_id, subagents.parent_tool_call_id),
+        progress_json = CASE WHEN excluded.progress_json = '{}' THEN subagents.progress_json ELSE excluded.progress_json END,
+        omp_last_update = MAX(subagents.omp_last_update, excluded.omp_last_update),
+        updated_at = excluded.updated_at,
+        completed_at = CASE WHEN excluded.completed_at IS NULL THEN subagents.completed_at ELSE excluded.completed_at END
+    `).run({
+      sessionId,
+      subagentId: snapshot.id,
+      indexNumber: snapshot.index,
+      agent: snapshot.agent,
+      agentSource: snapshot.agentSource,
+      description: snapshot.description,
+      task: snapshot.task,
+      assignment: snapshot.assignment,
+      status: snapshot.status,
+      sessionFile: snapshot.sessionFile,
+      parentToolCallId: snapshot.parentToolCallId,
+      progressJson: JSON.stringify(progress),
+      lastUpdate,
+      now,
+      completedAt,
+    });
+  }
+
+  subagents(sessionId: string): SubagentRecord[] {
+    return (this.db.query(`
+      SELECT * FROM subagents WHERE session_id = $sessionId
+      ORDER BY index_number ASC, subagent_id ASC
+    `).all({ sessionId }) as Row[]).map(mapSubagent);
+  }
+
+  subagent(sessionId: string, subagentId: string): SubagentRecord | null {
+    const row = this.db.query(`
+      SELECT * FROM subagents WHERE session_id = $sessionId AND subagent_id = $subagentId
+    `).get({ sessionId, subagentId }) as Row | null;
+    return row ? mapSubagent(row) : null;
+  }
+
+  appendSubagentTranscript(
+    sessionId: string,
+    subagentId: string,
+    sessionFile: string,
+    nextByte: number,
+    reset: boolean,
+    messages: JsonObject[]
+  ): void {
+    const row = this.db.query(`
+      SELECT transcript_json FROM subagents
+      WHERE session_id = $sessionId AND subagent_id = $subagentId
+    `).get({ sessionId, subagentId }) as { transcript_json: string } | null;
+    if (!row) return;
+    const prior = reset ? [] : parseObjects(row.transcript_json);
+    const transcript = [...prior, ...messages].slice(-32);
+    this.db.query(`
+      UPDATE subagents SET session_file = $sessionFile,
+        transcript_offset = $nextByte, transcript_json = $transcriptJson,
+        updated_at = $now
+      WHERE session_id = $sessionId AND subagent_id = $subagentId
+    `).run({
+      sessionId,
+      subagentId,
+      sessionFile,
+      nextByte: Math.max(0, Math.trunc(nextByte)),
+      transcriptJson: JSON.stringify(transcript),
+      now: Date.now(),
+    });
+  }
+
+  stopSubagents(sessionId: string, status: Extract<SubagentStatus, "aborted" | "interrupted">): void {
+    const now = Date.now();
+    this.db.query(`
+      UPDATE subagents SET status = $status, updated_at = $now, completed_at = $now
+      WHERE session_id = $sessionId AND status IN ('pending', 'running')
+    `).run({ sessionId, status, now });
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pending_delegations (
@@ -350,10 +454,33 @@ export class LeetcoderDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS subagents (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        subagent_id TEXT NOT NULL,
+        index_number INTEGER NOT NULL,
+        agent TEXT NOT NULL,
+        agent_source TEXT NOT NULL,
+        description TEXT,
+        task TEXT,
+        assignment TEXT,
+        status TEXT NOT NULL,
+        session_file TEXT,
+        parent_tool_call_id TEXT,
+        progress_json TEXT NOT NULL DEFAULT '{}',
+        transcript_offset INTEGER NOT NULL DEFAULT 0,
+        transcript_json TEXT NOT NULL DEFAULT '[]',
+        omp_last_update INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        PRIMARY KEY (session_id, subagent_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_sessions_status_updated ON sessions(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
       CREATE INDEX IF NOT EXISTS idx_pending_expiry ON pending_delegations(expires_at);
       CREATE INDEX IF NOT EXISTS idx_followups_session_status ON followups(session_id, status, id);
+      CREATE INDEX IF NOT EXISTS idx_subagents_session_status ON subagents(session_id, status, updated_at DESC);
     `);
   }
 
@@ -367,6 +494,10 @@ export class LeetcoderDatabase {
     this.db.query("UPDATE followups SET status = 'queued', updated_at = $now WHERE status = 'running'").run({
       now: Date.now(),
     });
+    this.db.query(`
+      UPDATE subagents SET status = 'interrupted', updated_at = $now, completed_at = $now
+      WHERE status IN ('pending', 'running')
+    `).run({ now: Date.now() });
   }
 }
 
@@ -417,6 +548,29 @@ function mapSession(row: Row): SessionRecord {
   };
 }
 
+function mapSubagent(row: Row): SubagentRecord {
+  return {
+    sessionId: String(row.session_id),
+    id: String(row.subagent_id),
+    index: Number(row.index_number),
+    agent: String(row.agent),
+    agentSource: String(row.agent_source),
+    description: nullable(row.description),
+    task: nullable(row.task),
+    assignment: nullable(row.assignment),
+    status: String(row.status) as SubagentStatus,
+    sessionFile: nullable(row.session_file),
+    parentToolCallId: nullable(row.parent_tool_call_id),
+    lastUpdate: Number(row.omp_last_update),
+    progress: parseObject(row.progress_json),
+    transcriptOffset: Number(row.transcript_offset),
+    transcript: parseObjects(row.transcript_json),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    completedAt: row.completed_at === null ? null : Number(row.completed_at),
+  };
+}
+
 function nullable(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
@@ -439,6 +593,17 @@ function parseObject(value: unknown): JsonObject {
   }
 }
 
+function parseObjects(value: unknown): JsonObject[] {
+  try {
+    const parsed = JSON.parse(String(value)) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function truncate(value: string, maximum: number): string {
   return value.length <= maximum ? value : `${value.slice(0, maximum)}\n…[truncated]`;
 }
@@ -450,4 +615,8 @@ function limitEvent(value: JsonObject): JsonObject {
 
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "session";
+}
+
+function isTerminalSubagentStatus(status: SubagentStatus): boolean {
+  return new Set<SubagentStatus>(["completed", "failed", "aborted", "interrupted"]).has(status);
 }

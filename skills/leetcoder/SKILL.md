@@ -5,10 +5,11 @@ description: Autonomously delegate bounded implementation, bug-fix, audit, refac
 
 # Leetcoder delegation
 
-Leetcoder is Hermes' autonomous OMP control pane. It owns native OMP RPC
-sessions, isolated git worktrees, persistent history, steering, Advisor review,
-automatic recovery, and durable Librarian handoffs. Its SQLite state survives
-Hermes compaction and gateway restarts.
+Leetcoder is Hermes' autonomous OMP control pane. It owns persistent OMP root
+sessions, isolated git worktrees, steering, Advisor review, automatic recovery,
+and durable Librarian handoffs. Each root may elect OMP's native `task`/`hub`
+swarm; Leetcoder persists that child hierarchy and incremental transcript state
+so it survives Hermes compaction and gateway restarts.
 
 ## Mandatory start flow
 
@@ -40,11 +41,14 @@ prepare again.
 ## Lifecycle
 
 - `leetcoder_status` with no ID restores awareness of all ongoing/recent work
-  after compaction. With an ID it adds recent events and live git status. Every
-  view includes the objective, literal current activity, and draft location.
+  after compaction, including nested OMP child identities and states. With an ID
+  it adds child progress, incremental transcript excerpts, `agent://` artifacts,
+  `history://` transcripts, recent events, and live git status. Every view
+  includes the objective, literal current activity, and draft location.
 - `leetcoder_steer` immediately redirects an active turn. If the worker is not
   active it durably queues the direction and resumes the native OMP session;
-  callers never choose between follow-up and resume mechanisms.
+  the root is reminded to reuse a relevant child through `hub` before spawning
+  another. Callers never choose between follow-up and resume mechanisms.
 - `leetcoder_stop` preserves the branch and worktree. Prefer graceful stop;
   force stop explicitly records that the Librarian handoff is not guaranteed.
 

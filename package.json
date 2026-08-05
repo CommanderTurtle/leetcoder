@@ -1,7 +1,7 @@
 {
   "name": "@commanderturtle/leetcoder",
-  "version": "0.1.0",
-  "description": "Autonomous Hermes delegation to persistent, Advisor-reviewed oh-my-pi worktree sessions",
+  "version": "0.2.0",
+  "description": "Autonomous Hermes delegation to persistent, swarm-native oh-my-pi worktree sessions",
   "type": "module",
   "license": "AGPL-3.0-only",
   "author": "CommanderTurtle",

@@ -22,6 +22,15 @@ export type SessionStatus =
   | "closing"
   | "closed";
 
+export type SubagentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "aborted"
+  | "interrupted"
+  | "unknown";
+
 export interface LeetcoderConfig {
   version: 1;
   listen: {
@@ -105,6 +114,38 @@ export interface SessionEvent {
   kind: string;
   body: JsonObject;
   createdAt: number;
+}
+
+export interface OmpSubagentSnapshot {
+  id: string;
+  index: number;
+  agent: string;
+  agentSource: string;
+  description: string | null;
+  task: string | null;
+  assignment: string | null;
+  status: SubagentStatus;
+  sessionFile: string | null;
+  parentToolCallId: string | null;
+  lastUpdate: number;
+  progress: JsonObject;
+}
+
+export interface OmpSubagentTranscript {
+  sessionFile: string;
+  fromByte: number;
+  nextByte: number;
+  reset: boolean;
+  messages: JsonObject[];
+}
+
+export interface SubagentRecord extends OmpSubagentSnapshot {
+  sessionId: string;
+  transcriptOffset: number;
+  transcript: JsonObject[];
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
 }
 
 export interface WorkspaceInfo {

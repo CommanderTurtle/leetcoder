@@ -4,8 +4,16 @@ import { LeetcoderDatabase } from "./database.ts";
 import { createWorkspace, inspectRepository } from "./git.ts";
 import { systemPromptPath } from "./paths.ts";
 import { OmpWorkerPool, type OmpRpcWorker } from "./rpc.ts";
-import { handoffPrompt, initialPrompt, recoveryPrompt } from "./templates.ts";
-import type { JsonObject, LeetcoderConfig, PrepareRequest, SessionRecord } from "./types.ts";
+import { handoffPrompt, initialPrompt, recoveryPrompt, steeringPrompt } from "./templates.ts";
+import type {
+  JsonObject,
+  LeetcoderConfig,
+  OmpSubagentSnapshot,
+  PrepareRequest,
+  SessionRecord,
+  SubagentRecord,
+  SubagentStatus,
+} from "./types.ts";
 
 const LIBRARIAN_ADD_TOOL = "mcp__librarian_memory_add";
 
@@ -13,6 +21,7 @@ export class LeetcoderOrchestrator {
   readonly db: LeetcoderDatabase;
   readonly workers: OmpWorkerPool;
   private readonly drains = new Set<string>();
+  private readonly transcriptSyncs = new Map<string, Promise<void>>();
   private reaper: ReturnType<typeof setInterval> | undefined;
 
   constructor(readonly config: LeetcoderConfig) {
@@ -76,16 +85,17 @@ export class LeetcoderOrchestrator {
     };
   }
 
-  list(includeClosed = false, limit = 100): JsonObject {
-    const sessions = this.db.listSessions(limit)
-      .filter((session) => includeClosed || session.status !== "closed")
-      .map((session) => this.sessionView(session));
+  async list(includeClosed = false, limit = 100): Promise<JsonObject> {
+    const records = this.db.listSessions(limit)
+      .filter((session) => includeClosed || session.status !== "closed");
+    await Promise.all(records.map((session) => this.syncSwarmState(session.id, false)));
+    const sessions = records.map((session) => this.sessionView(this.db.getSession(session.id)));
     return { sessions, workerProcesses: this.workers.size };
   }
 
-  inspect(id: string, eventLimit = 40): JsonObject {
-    const session = this.db.getSession(id);
-    return this.sessionView(session, true, eventLimit);
+  async inspect(id: string, eventLimit = 40): Promise<JsonObject> {
+    await this.syncSwarmState(id, true);
+    return this.sessionView(this.db.getSession(id), true, eventLimit);
   }
 
   async direction(id: string, message: string): Promise<JsonObject> {
@@ -93,16 +103,18 @@ export class LeetcoderOrchestrator {
     const direction = message.trim();
     if (!direction) throw new Error("Steering message cannot be empty");
     if (session.status === "closed") throw new Error("A closed Leetcoder session cannot accept direction; delegate a new session instead");
+    const subagents = this.db.subagents(id);
+    const guidedDirection = steeringPrompt(session, direction, subagents);
     const worker = this.workers.get(id);
     if (isExecuting(session.status) && worker?.isAlive) {
-      await worker.steer(direction);
-      this.db.addEvent(id, "hermes_steer", { message: direction });
+      await worker.steer(guidedDirection);
+      this.db.addEvent(id, "hermes_steer", { message: direction, knownSubagents: subagents.map((item) => item.id) });
       return { accepted: true, mode: "immediate-steer", session: this.sessionView(this.db.getSession(id)) };
     }
 
     const prompt = new Set(["paused", "failed", "completed"]).has(session.status)
-      ? recoveryPrompt(session, direction)
-      : direction;
+      ? recoveryPrompt(session, direction, subagents)
+      : guidedDirection;
     const queueId = this.db.enqueueFollowUp(id, prompt);
     this.db.addEvent(id, "hermes_direction_queued", { queueId, message: direction, priorStatus: session.status });
     if (!isExecuting(session.status)) this.scheduleDrain(id);
@@ -120,6 +132,7 @@ export class LeetcoderOrchestrator {
     const worker = this.workers.get(id);
     if (force) {
       this.db.setStatus(id, "closed", "force-closed", "Force-closed before a guaranteed Librarian handoff");
+      this.db.stopSubagents(id, "aborted");
       this.db.addEvent(id, "force_closed", {});
       if (worker?.isAlive) await worker.abort().catch(() => undefined);
       await this.workers.drop(id);
@@ -147,7 +160,7 @@ export class LeetcoderOrchestrator {
   resumeQueuedWork(): void {
     for (const session of this.db.pausedSessions()) {
       if (this.db.queuedFollowUpCount(session.id) === 0) {
-        const queueId = this.db.enqueueFollowUp(session.id, recoveryPrompt(session));
+        const queueId = this.db.enqueueFollowUp(session.id, recoveryPrompt(session, undefined, this.db.subagents(session.id)));
         this.db.addEvent(session.id, "automatic_recovery_queued", { queueId, priorPhase: session.phase });
       }
     }
@@ -163,6 +176,12 @@ export class LeetcoderOrchestrator {
       maxWorkers: this.config.omp.maxWorkers,
       profile: this.config.omp.profile,
       advisor: true,
+      nativeSwarm: {
+        engine: "omp-task",
+        subscription: "progress",
+        durableChildRegistry: true,
+        incrementalTranscripts: true,
+      },
       dataRoot: this.config.paths.dataRoot,
     };
   }
@@ -170,6 +189,7 @@ export class LeetcoderOrchestrator {
   private sessionView(session: SessionRecord, detailed = false, eventLimit = 40): JsonObject {
     const events = this.db.events(session.id, detailed ? eventLimit : 1);
     const latest = events.at(-1);
+    const subagents = this.db.subagents(session.id);
     const view: JsonObject = {
       id: session.id,
       title: session.title,
@@ -177,7 +197,7 @@ export class LeetcoderOrchestrator {
       template: session.template,
       status: session.status,
       phase: session.phase,
-      currentActivity: activitySummary(session, latest),
+      currentActivity: activitySummary(session, latest, subagents),
       draft: {
         kind: session.sourceRepo ? "git-worktree" : "standalone-directory",
         directory: session.worktree,
@@ -194,6 +214,7 @@ export class LeetcoderOrchestrator {
         suggestedPath: session.handoffSuggestedPath,
       },
       ompSessionPath: session.sessionPath,
+      nativeSwarm: swarmView(subagents, detailed),
       createdAt: new Date(session.createdAt).toISOString(),
       updatedAt: new Date(session.updatedAt).toISOString(),
     };
@@ -257,16 +278,18 @@ export class LeetcoderOrchestrator {
       this.db.setSessionIdentity(id, result.sessionPath || worker.sessionPath || "", result.sessionId || worker.sessionId);
       this.db.setLastOutput(id, result.text);
       this.db.addEvent(id, "turn_finished", { phase, output: truncate(result.text, 20_000) });
+      let subagents = await this.syncSwarmState(id, true);
 
       session = this.db.getSession(id);
       const closeAfterHandoff = session.status === "closing";
       this.db.resetHandoff(id);
       this.db.setStatus(id, "handoff", "librarian-handoff");
-      let handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, false));
+      let handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, false, subagents));
       this.db.setLastOutput(id, handoffResult.text);
       if (!this.db.getSession(id).handoffComplete) {
         this.db.addEvent(id, "handoff_retry", { reason: `${LIBRARIAN_ADD_TOOL} did not complete successfully` });
-        handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, true));
+        subagents = await this.syncSwarmState(id, true);
+        handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, true, subagents));
         this.db.setLastOutput(id, handoffResult.text);
       }
       if (!this.db.getSession(id).handoffComplete) {
@@ -315,6 +338,7 @@ export class LeetcoderOrchestrator {
       onExit: () => {
         const status = safeSessionStatus(this.db, session.id);
         if (status && isExecuting(status)) {
+          this.db.stopSubagents(session.id, "interrupted");
           this.db.setStatus(session.id, "paused", "worker-exited", "OMP worker exited; the persisted session can be resumed");
           this.db.addEvent(session.id, "worker_exited", {});
         }
@@ -324,6 +348,16 @@ export class LeetcoderOrchestrator {
 
   private handleWorkerEvent(id: string, event: JsonObject): void {
     const type = typeof event.type === "string" ? event.type : "unknown";
+    if (type === "subagent_lifecycle") {
+      const snapshot = lifecycleSnapshot(asObject(event.payload));
+      if (snapshot) {
+        this.db.upsertSubagent(id, snapshot);
+        if (isTerminalSubagentStatus(snapshot.status)) this.scheduleTranscriptSync(id, snapshot.id);
+      }
+    } else if (type === "subagent_progress") {
+      const snapshot = progressSnapshot(asObject(event.payload));
+      if (snapshot) this.db.upsertSubagent(id, snapshot);
+    }
     if (new Set([
       "agent_start", "agent_end", "message_end", "tool_execution_start", "tool_execution_end",
       "subagent_lifecycle", "subagent_progress", "extension_error", "worker_stderr",
@@ -333,6 +367,57 @@ export class LeetcoderOrchestrator {
     if (type === "tool_execution_end" && event.toolName === LIBRARIAN_ADD_TOOL && !toolFailed(event)) {
       const session = this.db.getSession(id);
       if (session.status === "handoff" || session.phase === "librarian-handoff") this.db.markHandoffComplete(id);
+    }
+  }
+
+  private async syncSwarmState(id: string, includeTranscripts: boolean): Promise<SubagentRecord[]> {
+    const worker = this.workers.get(id);
+    if (!worker?.isAlive) return this.db.subagents(id);
+    try {
+      for (const snapshot of await worker.getSubagents()) this.db.upsertSubagent(id, snapshot);
+    } catch {
+      // The persisted event stream remains authoritative if an RPC snapshot races worker shutdown.
+    }
+    if (includeTranscripts) {
+      for (const subagent of this.db.subagents(id)) await this.captureSubagentTranscript(id, subagent.id, worker);
+    }
+    return this.db.subagents(id);
+  }
+
+  private scheduleTranscriptSync(sessionId: string, subagentId: string): void {
+    queueMicrotask(() => {
+      const worker = this.workers.get(sessionId);
+      if (worker?.isAlive) void this.captureSubagentTranscript(sessionId, subagentId, worker);
+    });
+  }
+
+  private captureSubagentTranscript(sessionId: string, subagentId: string, worker: OmpRpcWorker): Promise<void> {
+    const key = `${sessionId}:${subagentId}`;
+    const existing = this.transcriptSyncs.get(key);
+    if (existing) return existing;
+    const sync = this.readSubagentTranscript(sessionId, subagentId, worker)
+      .finally(() => {
+        if (this.transcriptSyncs.get(key) === sync) this.transcriptSyncs.delete(key);
+      });
+    this.transcriptSyncs.set(key, sync);
+    return sync;
+  }
+
+  private async readSubagentTranscript(sessionId: string, subagentId: string, worker: OmpRpcWorker): Promise<void> {
+    const record = this.db.subagent(sessionId, subagentId);
+    if (!record?.sessionFile) return;
+    try {
+      const transcript = await worker.getSubagentMessages(subagentId, record.transcriptOffset);
+      this.db.appendSubagentTranscript(
+        sessionId,
+        subagentId,
+        transcript.sessionFile || record.sessionFile,
+        transcript.nextByte,
+        transcript.reset,
+        transcriptMessages(transcript.messages)
+      );
+    } catch {
+      // Old session files can outlive the RPC registry; their history:// URI remains readable by OMP.
     }
   }
 
@@ -378,7 +463,192 @@ function compactEvent(event: JsonObject): JsonObject {
   for (const key of ["type", "toolCallId", "toolName", "args", "result", "isError", "error", "message", "text", "subagentId", "status", "progress"]) {
     if (key in event) copy[key] = event[key];
   }
+  if (event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)) {
+    copy.payload = compactSubagentPayload(event.payload as JsonObject);
+  }
   return copy;
+}
+
+function compactSubagentPayload(payload: JsonObject): JsonObject {
+  const copy: JsonObject = {};
+  for (const key of [
+    "id", "index", "agent", "agentSource", "description", "status", "task", "assignment",
+    "sessionFile", "parentToolCallId", "detached",
+  ]) if (key in payload) copy[key] = payload[key];
+  if (payload.progress && typeof payload.progress === "object" && !Array.isArray(payload.progress)) {
+    copy.progress = compactProgress(payload.progress as JsonObject);
+  }
+  return copy;
+}
+
+function lifecycleSnapshot(payload: JsonObject): OmpSubagentSnapshot | null {
+  const id = firstText(payload.id);
+  if (!id) return null;
+  const lifecycle = firstText(payload.status);
+  const status = lifecycle === "started" ? "running" : normalizeSubagentStatus(lifecycle);
+  return {
+    id,
+    index: finiteInteger(payload.index),
+    agent: firstText(payload.agent) || "task",
+    agentSource: firstText(payload.agentSource) || "unknown",
+    description: nullableText(payload.description),
+    task: null,
+    assignment: null,
+    status,
+    sessionFile: nullableText(payload.sessionFile),
+    parentToolCallId: nullableText(payload.parentToolCallId),
+    lastUpdate: Date.now(),
+    progress: {},
+  };
+}
+
+function progressSnapshot(payload: JsonObject): OmpSubagentSnapshot | null {
+  const progress = asObject(payload.progress);
+  const id = firstText(progress.id, payload.id);
+  if (!id) return null;
+  return {
+    id,
+    index: finiteInteger(payload.index ?? progress.index),
+    agent: firstText(payload.agent, progress.agent) || "task",
+    agentSource: firstText(payload.agentSource, progress.agentSource) || "unknown",
+    description: nullableText(progress.description, payload.description),
+    task: nullableText(payload.task, progress.task),
+    assignment: nullableText(payload.assignment, progress.assignment),
+    status: normalizeSubagentStatus(progress.status),
+    sessionFile: nullableText(payload.sessionFile),
+    parentToolCallId: nullableText(payload.parentToolCallId),
+    lastUpdate: Date.now(),
+    progress: compactProgress(progress),
+  };
+}
+
+function compactProgress(progress: JsonObject): JsonObject {
+  const copy: JsonObject = {};
+  for (const key of [
+    "index", "id", "agent", "agentSource", "status", "task", "assignment", "description",
+    "lastIntent", "currentTool", "currentToolStartMs", "toolCount", "requests", "tokens",
+    "contextTokens", "contextWindow", "cost", "durationMs", "resolvedModel", "resolvedModelIsFallback",
+    "retryState", "retryFailure",
+  ]) if (key in progress) copy[key] = progress[key];
+  if (typeof progress.currentToolArgs === "string") copy.currentToolArgs = truncate(progress.currentToolArgs, 2_000);
+  if (Array.isArray(progress.recentTools)) copy.recentTools = progress.recentTools.slice(-8);
+  if (Array.isArray(progress.recentOutput)) {
+    copy.recentOutput = progress.recentOutput.slice(-8).map((item) => typeof item === "string" ? truncate(item, 2_000) : item);
+  }
+  return copy;
+}
+
+function transcriptMessages(messages: JsonObject[]): JsonObject[] {
+  return messages.map((message) => {
+    const role = firstText(message.role, message.type) || "message";
+    const text = truncate(messageText(message.content), 3_000);
+    const summary: JsonObject = { role };
+    if (text) summary.text = text;
+    if (typeof message.name === "string" && message.name) summary.name = message.name;
+    if (typeof message.timestamp === "number") summary.timestamp = message.timestamp;
+    return summary;
+  }).filter((message) => Object.keys(message).length > 1);
+}
+
+function messageText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(messageText).filter(Boolean).join("\n");
+  const block = asObject(value);
+  const direct = firstText(block.text, block.thinking);
+  if (direct) return direct;
+  const nested = messageText(block.content);
+  if (nested) return nested;
+  const name = firstText(block.name, block.toolName);
+  return name ? `[${firstText(block.type) || "tool"}: ${name}]` : "";
+}
+
+function swarmView(subagents: SubagentRecord[], detailed: boolean): JsonObject {
+  const ids = new Set(subagents.map((subagent) => subagent.id));
+  const nodes = new Map<string, JsonObject>();
+  for (const subagent of subagents) nodes.set(subagent.id, subagentView(subagent, parentSubagentId(subagent.id, ids), detailed));
+  const roots: JsonObject[] = [];
+  for (const subagent of subagents) {
+    const node = nodes.get(subagent.id)!;
+    const parentId = parentSubagentId(subagent.id, ids);
+    const parent = parentId ? nodes.get(parentId) : undefined;
+    if (parent) (parent.children as JsonObject[]).push(node);
+    else roots.push(node);
+  }
+  const counts: Record<string, number> = {};
+  for (const subagent of subagents) counts[subagent.status] = (counts[subagent.status] || 0) + 1;
+  return {
+    engine: "omp-task-hub",
+    election: subagents.length ? "native-subagents-used" : "root-direct-so-far",
+    childCount: subagents.length,
+    activeCount: subagents.filter((item) => item.status === "pending" || item.status === "running").length,
+    statusCounts: counts,
+    children: roots,
+  };
+}
+
+function subagentView(subagent: SubagentRecord, parentId: string | null, detailed: boolean): JsonObject {
+  const progress = subagent.progress;
+  const view: JsonObject = {
+    id: subagent.id,
+    parentId,
+    index: subagent.index,
+    agent: subagent.agent,
+    agentSource: subagent.agentSource,
+    status: subagent.status,
+    description: subagent.description,
+    task: truncate(subagent.task || subagent.assignment || "", detailed ? 4_000 : 500),
+    currentIntent: nullableText(progress.lastIntent),
+    currentTool: nullableText(progress.currentTool),
+    artifact: agentUri(subagent.id),
+    transcript: `history://${subagent.id}`,
+    updatedAt: new Date(subagent.updatedAt).toISOString(),
+    children: [],
+  };
+  if (detailed) {
+    view.sessionFile = subagent.sessionFile;
+    view.parentToolCallId = subagent.parentToolCallId;
+    view.progress = progress;
+    view.transcriptOffset = subagent.transcriptOffset;
+    view.recentTranscript = subagent.transcript;
+  }
+  return view;
+}
+
+function parentSubagentId(id: string, ids: Set<string>): string | null {
+  const parts = id.split(".");
+  while (parts.length > 1) {
+    parts.pop();
+    const candidate = parts.join(".");
+    if (ids.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+function agentUri(id: string): string {
+  const [root, ...children] = id.split(".");
+  return children.length ? `agent://${root}/${children.join("/")}` : `agent://${id}`;
+}
+
+function asObject(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+}
+
+function nullableText(...values: unknown[]): string | null {
+  return firstText(...values) || null;
+}
+
+function finiteInteger(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+}
+
+function normalizeSubagentStatus(value: unknown): SubagentStatus {
+  const statuses = new Set<SubagentStatus>(["pending", "running", "completed", "failed", "aborted", "interrupted"]);
+  return typeof value === "string" && statuses.has(value as SubagentStatus) ? value as SubagentStatus : "unknown";
+}
+
+function isTerminalSubagentStatus(status: SubagentStatus): boolean {
+  return new Set<SubagentStatus>(["completed", "failed", "aborted", "interrupted"]).has(status);
 }
 
 function toolFailed(event: JsonObject): boolean {
@@ -411,10 +681,28 @@ function normalize(value: string): string {
   return value.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
-function activitySummary(session: SessionRecord, latest: { kind: string; body: JsonObject } | undefined): string {
+function activitySummary(
+  session: SessionRecord,
+  latest: { kind: string; body: JsonObject } | undefined,
+  subagents: SubagentRecord[]
+): string {
+  const activeSubagent = [...subagents]
+    .filter((item) => item.status === "pending" || item.status === "running")
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+  if (activeSubagent) {
+    const progress = activeSubagent.progress;
+    const retry = asObject(progress.retryState);
+    const retryMessage = firstText(retry.errorMessage);
+    if (retryMessage) return `OMP child ${activeSubagent.id} is retrying: ${truncate(retryMessage, 300)}`;
+    const tool = firstText(progress.currentTool);
+    const intent = firstText(progress.lastIntent, activeSubagent.description, activeSubagent.task);
+    return `OMP child ${activeSubagent.id} (${activeSubagent.agent})${tool ? ` is running ${tool}` : " is working"}${intent ? `: ${truncate(intent, 300)}` : ""}`;
+  }
   if (latest) {
     const tool = typeof latest.body.toolName === "string" ? latest.body.toolName : "";
-    const progress = firstText(latest.body.progress, latest.body.message, latest.body.text);
+    const payload = asObject(latest.body.payload);
+    const childProgress = asObject(payload.progress);
+    const progress = firstText(childProgress.lastIntent, payload.description, payload.task, latest.body.progress, latest.body.message, latest.body.text);
     switch (latest.kind) {
       case "tool_execution_start":
         return `Running ${tool || "an OMP tool"}${progress ? `: ${truncate(progress, 300)}` : ""}`;

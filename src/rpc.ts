@@ -1,6 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
-import type { JsonObject, OmpRunResult, OmpWorkerOptions, ThinkingLevel } from "./types.ts";
+import type {
+  JsonObject,
+  OmpRunResult,
+  OmpSubagentSnapshot,
+  OmpSubagentTranscript,
+  OmpWorkerOptions,
+  SubagentStatus,
+  ThinkingLevel,
+} from "./types.ts";
 
 interface PendingRequest {
   resolve: (message: JsonObject) => void;
@@ -154,6 +162,32 @@ export class OmpRpcWorker {
   async getState(): Promise<JsonObject> {
     const response = await this.request("get_state");
     return asObject(response.data);
+  }
+
+  async getSubagents(): Promise<OmpSubagentSnapshot[]> {
+    const response = await this.request("get_subagents");
+    const subagents = asObject(response.data).subagents;
+    return Array.isArray(subagents)
+      ? subagents.map(normalizeSubagentSnapshot).filter((item): item is OmpSubagentSnapshot => Boolean(item))
+      : [];
+  }
+
+  async getSubagentMessages(subagentId: string, fromByte: number): Promise<OmpSubagentTranscript> {
+    const response = await this.request("get_subagent_messages", {
+      subagentId,
+      fromByte: Math.max(0, Math.trunc(fromByte)),
+    });
+    const data = asObject(response.data);
+    const messages = Array.isArray(data.messages)
+      ? data.messages.map(asObject).filter((message) => Object.keys(message).length > 0)
+      : [];
+    return {
+      sessionFile: firstString(data.sessionFile),
+      fromByte: finiteInteger(data.fromByte),
+      nextByte: finiteInteger(data.nextByte),
+      reset: data.reset === true,
+      messages,
+    };
   }
 
   async close(): Promise<void> {
@@ -523,6 +557,40 @@ function asObject(value: unknown): JsonObject {
 function firstString(...values: unknown[]): string {
   for (const value of values) if (typeof value === "string" && value) return value;
   return "";
+}
+
+function finiteInteger(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+}
+
+function normalizeSubagentSnapshot(value: unknown): OmpSubagentSnapshot | null {
+  const snapshot = asObject(value);
+  const id = firstString(snapshot.id);
+  if (!id) return null;
+  return {
+    id,
+    index: finiteInteger(snapshot.index),
+    agent: firstString(snapshot.agent) || "task",
+    agentSource: firstString(snapshot.agentSource) || "unknown",
+    description: nullableString(snapshot.description),
+    task: nullableString(snapshot.task),
+    assignment: nullableString(snapshot.assignment),
+    status: normalizeSubagentStatus(snapshot.status),
+    sessionFile: nullableString(snapshot.sessionFile),
+    parentToolCallId: nullableString(snapshot.parentToolCallId),
+    lastUpdate: finiteInteger(snapshot.lastUpdate) || Date.now(),
+    progress: asObject(snapshot.progress),
+  };
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+function normalizeSubagentStatus(value: unknown): SubagentStatus {
+  const statuses = new Set<SubagentStatus>(["pending", "running", "completed", "failed", "aborted", "interrupted"]);
+  return typeof value === "string" && statuses.has(value as SubagentStatus) ? value as SubagentStatus : "unknown";
 }
 
 async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {

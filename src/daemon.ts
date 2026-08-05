@@ -25,9 +25,9 @@ export async function serve(config: LeetcoderConfig): Promise<void> {
           case "/v1/confirm":
             return json(orchestrator.confirm(string(body.token)));
           case "/v1/list":
-            return json(orchestrator.list(boolean(body.includeClosed), integer(body.limit, 100)));
+            return json(await orchestrator.list(boolean(body.includeClosed), integer(body.limit, 100)));
           case "/v1/inspect":
-            return json(orchestrator.inspect(string(body.sessionId), integer(body.eventLimit, 40)));
+            return json(await orchestrator.inspect(string(body.sessionId), integer(body.eventLimit, 40)));
           case "/v1/direction":
             return json(await orchestrator.direction(string(body.sessionId), string(body.message)));
           case "/v1/close":

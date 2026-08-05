@@ -1,4 +1,4 @@
-import type { SessionRecord, TaskTemplate } from "./types.ts";
+import type { SessionRecord, SubagentRecord, TaskTemplate } from "./types.ts";
 
 const TEMPLATE_GUIDANCE: Record<TaskTemplate, string> = {
   implementation: `Implement the requested capability completely. Inspect the surrounding architecture before editing, preserve established conventions, account for lifecycle and failure paths, and leave a cohesive finished change rather than scaffolding or TODOs.`,
@@ -15,7 +15,7 @@ export function initialPrompt(session: SessionRecord): string {
   const files = session.files.length ? session.files.map((file) => `- ${file}`).join("\n") : "- No file restriction was supplied; remain within the delegated repository and task.";
   return `# Leetcoder delegation: ${session.title}
 
-You are the sole implementation agent for this isolated delegation. Work autonomously to a finished state inside the current worktree.
+You are the accountable root implementation agent for this isolated delegation. Work autonomously to a finished state inside the current worktree, using OMP's native task swarm only when specialist delegation materially improves the result.
 
 ## Objective
 
@@ -44,10 +44,20 @@ ${files}
 6. Run only proportionate validation demanded by the work. The absence of a test quota is deliberate.
 7. Do not stop at a plan, TODO list, or partial scaffold. Complete the task or report the exact blocker with evidence.
 8. End with a compact account of changes, files, validation, and any unresolved risk. The gateway will then request a durable Librarian handoff.
+
+## Native OMP swarm contract
+
+- Elect direct work for cohesive or small changes. Elect the native \`task\` tool for bounded research, review, implementation, or audit work that benefits from a specialist.
+- Before spawning, inspect the native \`hub\` roster and reuse or redirect a relevant existing agent. Do not duplicate active or parked work.
+- Give every child a stable descriptive name and a self-contained assignment: child sessions do not inherit this conversation transcript.
+- Use \`task.batch\` only for genuinely independent fan-out. Respect the configured concurrency and recursion bounds; never construct an uncontrolled agent tree.
+- Use OMP isolation for child edits when appropriate. Child patches or branches must merge into this outer Leetcoder worktree, which remains the canonical draft.
+- Communicate follow-up direction through \`hub\` so a child retains its context. Read \`agent://\` outputs and \`history://\` transcripts rather than respawning equivalent work.
+- You remain responsible for reconciling every child result, resolving conflicts, finishing the implementation, and reporting a single truthful outcome.
 `;
 }
 
-export function handoffPrompt(session: SessionRecord, finalOutput: string, retry: boolean): string {
+export function handoffPrompt(session: SessionRecord, finalOutput: string, retry: boolean, subagents: SubagentRecord[] = []): string {
   const prefix = retry
     ? "The required durable handoff was not observed. Do this now; do not merely describe it."
     : "The implementation turn is complete. Create its mandatory durable handoff now.";
@@ -65,6 +75,7 @@ The content must include:
 - source repository, worktree, branch, and base commit;
 - decisions and architecture actually used;
 - every changed file and its purpose;
+- native OMP subagents used, their roles, relevant \`agent://\` artifacts and \`history://\` transcripts, or an explicit note that the root elected direct execution;
 - validation performed and its result;
 - unresolved blockers, risks, or follow-ups;
 - enough context for another agent to resume without reconstructing this session.
@@ -74,19 +85,52 @@ Do not edit project files during this handoff unless correcting a factual omissi
 For reference, your prior completion summary was:
 
 ${truncate(finalOutput || "(no assistant summary was emitted)", 12_000)}
+
+Native swarm record captured by Leetcoder:
+
+${renderSwarmRecord(subagents)}
 `;
 }
 
-export function recoveryPrompt(session: SessionRecord, message?: string): string {
+export function recoveryPrompt(session: SessionRecord, message?: string, subagents: SubagentRecord[] = []): string {
   return `Resume the Leetcoder delegation \"${session.title}\" from its saved OMP session and current worktree. Inspect the actual repository state before acting; the gateway restarted and no in-flight assumption is trustworthy.
 
 Original objective:
 ${session.task}
 
 ${message ? `New direction from Hermes:\n${message}\n` : "Continue from the last safe point and finish the original objective."}
+
+Prior native subagent record:
+${renderSwarmRecord(subagents)}
+
+Run \`hub\` roster/list before creating another child. Reuse a relevant live or parked agent through \`hub\`; if the gateway restart made it unavailable, consult its \`agent://\` output and \`history://\` transcript before electing a replacement.
 `;
+}
+
+export function steeringPrompt(session: SessionRecord, message: string, subagents: SubagentRecord[]): string {
+  return `Hermes steering for Leetcoder delegation "${session.title}":
+
+${message}
+
+Before spawning another native task agent, inspect the \`hub\` roster and reuse a relevant existing child. Known child record:
+${renderSwarmRecord(subagents)}
+
+Apply this direction at the nearest safe boundary while keeping the outer Leetcoder worktree authoritative.`;
 }
 
 function truncate(value: string, maximum: number): string {
   return value.length <= maximum ? value : `${value.slice(0, maximum)}\n…[truncated]`;
+}
+
+function renderSwarmRecord(subagents: SubagentRecord[]): string {
+  if (subagents.length === 0) return "- No native task subagents recorded; the root elected direct execution so far.";
+  return subagents.map((subagent) => {
+    const task = truncate(subagent.task || subagent.description || "assignment details unavailable", 280).replace(/\s+/g, " ");
+    return `- ${subagent.id} [${subagent.agent}; ${subagent.status}] — ${task}\n  Artifact: ${agentUri(subagent.id)}\n  Transcript: history://${subagent.id}`;
+  }).join("\n");
+}
+
+function agentUri(id: string): string {
+  const [root, ...children] = id.split(".");
+  return children.length ? `agent://${root}/${children.join("/")}` : `agent://${id}`;
 }
