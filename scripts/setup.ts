@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -99,6 +100,12 @@ function configureOmpProfile(): void {
   parsed.marketplace = { ...record(parsed.marketplace), autoUpdate: "off" };
   writeFileSync(path.join(target, "config.yml"), stringify(parsed), { mode: 0o600 });
 
+  const providers = new Set(
+    Object.values(record(parsed.modelRoles))
+      .filter((value): value is string => typeof value === "string" && value.includes("/"))
+      .map((selector) => selector.slice(0, selector.indexOf("/"))),
+  );
+
   const mcp = JSON.parse(readFileSync(sourceMcp, "utf8")) as unknown;
   if (!isRecord(mcp)) fail(`OMP MCP config is not a mapping: ${sourceMcp}`);
   const servers = record(mcp.mcpServers);
@@ -108,8 +115,83 @@ function configureOmpProfile(): void {
   writeFileSync(path.join(target, "mcp.json"), `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
   copyFileSync(sourceModels, path.join(target, "models.yml"));
   chmodSync(path.join(target, "models.yml"), 0o600);
+  syncOmpProviderState(source, target, providers);
   copyFileSync(path.join(root, "rules", "advisor.md"), path.join(target, "WATCHDOG.md"));
   chmodSync(path.join(target, "WATCHDOG.md"), 0o600);
+}
+
+function syncOmpProviderState(source: string, target: string, providers: Set<string>): void {
+  if (providers.size === 0) fail("OMP's default profile does not define any model providers");
+
+  // Let OMP create its current profile-local database schemas. Leetcoder then
+  // copies only the provider rows its model roles actually use; unrelated
+  // credentials, usage history, sessions, and settings remain isolated.
+  const initialized = spawnSync(omp, ["--profile", "leetcoder", "models", "--json"], {
+    cwd: root,
+    stdio: "ignore",
+  });
+  if (initialized.status !== 0) fail("OMP could not initialize the isolated Leetcoder profile");
+
+  syncRowsByKey(
+    path.join(source, "agent.db"),
+    path.join(target, "agent.db"),
+    "auth_credentials",
+    "provider",
+    providers,
+    new Set(["id"]),
+  );
+  syncRowsByKey(
+    path.join(source, "models.db"),
+    path.join(target, "models.db"),
+    "model_cache",
+    "provider_id",
+    providers,
+  );
+}
+
+function syncRowsByKey(
+  sourcePath: string,
+  targetPath: string,
+  table: string,
+  key: string,
+  values: Set<string>,
+  excluded = new Set<string>(),
+): void {
+  for (const file of [sourcePath, targetPath]) if (!existsSync(file)) fail(`OMP profile database is missing: ${file}`);
+  const source = new Database(sourcePath, { readonly: true, create: false });
+  const target = new Database(targetPath);
+  try {
+    const sourceColumns = new Set(
+      (source.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name),
+    );
+    const columns = (target.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .map((row) => row.name)
+      .filter((name) => sourceColumns.has(name) && !excluded.has(name));
+    if (!columns.includes(key) || columns.length === 0) fail(`OMP profile table is incompatible: ${table}`);
+
+    const names = columns.join(", ");
+    const placeholders = columns.map(() => "?").join(", ");
+    const select = source.query(`SELECT ${names} FROM ${table} WHERE ${key} = ?`);
+    const remove = target.query(`DELETE FROM ${table} WHERE ${key} = ?`);
+    const insert = target.query(`INSERT INTO ${table} (${names}) VALUES (${placeholders})`);
+
+    target.exec("BEGIN IMMEDIATE");
+    try {
+      for (const value of values) {
+        remove.run(value);
+        for (const row of select.all(value) as Array<Record<string, unknown>>) {
+          insert.run(...columns.map((column) => row[column]) as SQLQueryBindings[]);
+        }
+      }
+      target.exec("COMMIT");
+    } catch (error) {
+      target.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    source.close();
+    target.close();
+  }
 }
 
 function writeEnv(): void {
