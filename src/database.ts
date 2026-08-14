@@ -12,6 +12,9 @@ import type {
   SubagentRecord,
   SubagentStatus,
   TaskTemplate,
+  VerificationRecord,
+  VerificationReport,
+  VerifiedFact,
   WorkspaceInfo,
 } from "./types.ts";
 
@@ -148,7 +151,7 @@ export class LeetcoderDatabase {
   activeSessions(): SessionRecord[] {
     return (this.db.query(`
       SELECT * FROM sessions
-      WHERE status IN ('starting', 'running', 'handoff', 'paused', 'closing')
+      WHERE status IN ('starting', 'running', 'verifying', 'handoff', 'paused', 'closing')
       ORDER BY updated_at DESC
     `).all() as Row[]).map(mapSession);
   }
@@ -162,7 +165,7 @@ export class LeetcoderDatabase {
   countExecuting(): number {
     const row = this.db.query(`
       SELECT count(*) AS value FROM sessions
-      WHERE status IN ('starting', 'running', 'handoff', 'closing')
+      WHERE status IN ('starting', 'running', 'verifying', 'handoff', 'closing')
     `).get() as { value: number };
     return Number(row.value);
   }
@@ -394,6 +397,78 @@ export class LeetcoderDatabase {
     `).run({ sessionId, status, now });
   }
 
+  addVerification(
+    sessionId: string,
+    round: number,
+    report: VerificationReport,
+    accepted: boolean,
+    workspaceBefore: string,
+    workspaceAfter: string,
+  ): VerificationRecord {
+    const createdAt = Date.now();
+    const result = this.db.query(`
+      INSERT INTO verification_rounds (
+        session_id, round_number, status, integrity, contract_audit, accepted,
+        report_json, raw_output, workspace_before, workspace_after, created_at
+      ) VALUES (
+        $sessionId, $round, $status, $integrity, $contractAudit, $accepted,
+        $reportJson, $raw, $workspaceBefore, $workspaceAfter, $createdAt
+      )
+    `).run({
+      sessionId,
+      round,
+      status: report.status,
+      integrity: report.integrity,
+      contractAudit: report.contractAudit,
+      accepted: accepted ? 1 : 0,
+      reportJson: JSON.stringify({
+        summary: report.summary,
+        completed: report.completed,
+        missing: report.missing,
+        blockers: report.blockers,
+        actionGuidance: report.actionGuidance,
+        evidence: report.evidence,
+      }),
+      raw: truncate(report.raw, 100_000),
+      workspaceBefore,
+      workspaceAfter,
+      createdAt,
+    });
+    const id = Number(result.lastInsertRowid);
+    if (accepted) {
+      const insert = this.db.query(`
+        INSERT INTO verified_facts (session_id, audit_id, fact, evidence_json, created_at)
+        VALUES ($sessionId, $auditId, $fact, $evidence, $createdAt)
+      `);
+      for (const fact of report.completed) {
+        const evidence = report.evidence.filter((item) => item.claim === fact);
+        insert.run({ sessionId, auditId: id, fact, evidence: JSON.stringify(evidence), createdAt });
+      }
+    }
+    return this.verifications(sessionId).find((item) => item.id === id)!;
+  }
+
+  verifications(sessionId: string): VerificationRecord[] {
+    return (this.db.query(`
+      SELECT * FROM verification_rounds WHERE session_id = $sessionId
+      ORDER BY round_number ASC, id ASC
+    `).all({ sessionId }) as Row[]).map(mapVerification);
+  }
+
+  latestVerification(sessionId: string): VerificationRecord | null {
+    const row = this.db.query(`
+      SELECT * FROM verification_rounds WHERE session_id = $sessionId
+      ORDER BY id DESC LIMIT 1
+    `).get({ sessionId }) as Row | null;
+    return row ? mapVerification(row) : null;
+  }
+
+  verifiedFacts(sessionId: string): VerifiedFact[] {
+    return (this.db.query(`
+      SELECT * FROM verified_facts WHERE session_id = $sessionId ORDER BY id ASC
+    `).all({ sessionId }) as Row[]).map(mapVerifiedFact);
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pending_delegations (
@@ -476,11 +551,37 @@ export class LeetcoderDatabase {
         PRIMARY KEY (session_id, subagent_id)
       );
 
+      CREATE TABLE IF NOT EXISTS verification_rounds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        round_number INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        integrity TEXT NOT NULL,
+        contract_audit TEXT NOT NULL,
+        accepted INTEGER NOT NULL DEFAULT 0,
+        report_json TEXT NOT NULL,
+        raw_output TEXT NOT NULL,
+        workspace_before TEXT NOT NULL,
+        workspace_after TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS verified_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        audit_id INTEGER NOT NULL REFERENCES verification_rounds(id) ON DELETE CASCADE,
+        fact TEXT NOT NULL,
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_sessions_status_updated ON sessions(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
       CREATE INDEX IF NOT EXISTS idx_pending_expiry ON pending_delegations(expires_at);
       CREATE INDEX IF NOT EXISTS idx_followups_session_status ON followups(session_id, status, id);
       CREATE INDEX IF NOT EXISTS idx_subagents_session_status ON subagents(session_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_verification_session_round ON verification_rounds(session_id, round_number);
+      CREATE INDEX IF NOT EXISTS idx_verified_facts_session ON verified_facts(session_id, id);
     `);
   }
 
@@ -489,7 +590,7 @@ export class LeetcoderDatabase {
       UPDATE sessions SET status = 'paused', phase = 'recovered',
         last_error = 'Gateway restarted while this session was active; resume or follow up to continue.',
         updated_at = $now
-      WHERE status IN ('starting', 'running', 'handoff', 'closing')
+      WHERE status IN ('starting', 'running', 'verifying', 'handoff', 'closing')
     `).run({ now: Date.now() });
     this.db.query("UPDATE followups SET status = 'queued', updated_at = $now WHERE status = 'running'").run({
       now: Date.now(),
@@ -571,6 +672,48 @@ function mapSubagent(row: Row): SubagentRecord {
   };
 }
 
+function mapVerification(row: Row): VerificationRecord {
+  const report = parseObject(row.report_json);
+  return {
+    id: Number(row.id),
+    sessionId: String(row.session_id),
+    round: Number(row.round_number),
+    status: String(row.status) as VerificationRecord["status"],
+    integrity: String(row.integrity) as VerificationRecord["integrity"],
+    contractAudit: String(row.contract_audit) as VerificationRecord["contractAudit"],
+    accepted: Boolean(row.accepted),
+    summary: typeof report.summary === "string" ? report.summary : "",
+    completed: stringArray(report.completed),
+    missing: stringArray(report.missing),
+    blockers: stringArray(report.blockers),
+    actionGuidance: stringArray(report.actionGuidance),
+    evidence: objectArray(report.evidence).map((item) => ({
+      claim: String(item.claim || ""),
+      artifact: String(item.artifact || ""),
+      observation: String(item.observation || ""),
+    })),
+    raw: String(row.raw_output || ""),
+    workspaceBefore: String(row.workspace_before),
+    workspaceAfter: String(row.workspace_after),
+    createdAt: Number(row.created_at),
+  };
+}
+
+function mapVerifiedFact(row: Row): VerifiedFact {
+  return {
+    id: Number(row.id),
+    sessionId: String(row.session_id),
+    auditId: Number(row.audit_id),
+    fact: String(row.fact),
+    evidence: objectArray(row.evidence_json).map((item) => ({
+      claim: String(item.claim || ""),
+      artifact: String(item.artifact || ""),
+      observation: String(item.observation || ""),
+    })),
+    createdAt: Number(row.created_at),
+  };
+}
+
 function nullable(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
@@ -602,6 +745,19 @@ function parseObjects(value: unknown): JsonObject[] {
   } catch {
     return [];
   }
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function objectArray(value: unknown): JsonObject[] {
+  const parsed = typeof value === "string" ? (() => {
+    try { return JSON.parse(value) as unknown; } catch { return []; }
+  })() : value;
+  return Array.isArray(parsed)
+    ? parsed.filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
 }
 
 function truncate(value: string, maximum: number): string {

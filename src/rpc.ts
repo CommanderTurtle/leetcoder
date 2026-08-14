@@ -66,6 +66,11 @@ export class OmpRpcWorker {
     const args: string[] = [];
     if (options.profile.trim() && options.profile !== "default") args.push("--profile", options.profile);
     if (options.advisor) args.push("--advisor");
+    if (options.ephemeral) args.push("--no-session");
+    if (options.noSkills) args.push("--no-skills");
+    if (options.noRules) args.push("--no-rules");
+    if (options.noExtensions) args.push("--no-extensions");
+    if (options.tools?.length) args.push("--tools", options.tools.join(","));
     args.push(
       "--mode", "rpc",
       "--approval-mode", "yolo",

@@ -7,7 +7,8 @@ description: Autonomously delegate bounded implementation, bug-fix, audit, refac
 
 Leetcoder is Hermes' autonomous OMP control pane. It owns persistent OMP root
 sessions, isolated git worktrees, steering, Advisor review, automatic recovery,
-and durable Librarian handoffs. Each root may elect OMP's native `task`/`hub`
+fresh read-only completion verification, an accepted-fact ledger, and durable
+Librarian handoffs. Each root may elect OMP's native `task`/`hub`
 swarm; Leetcoder persists that child hierarchy and incremental transcript state
 so it survives Hermes compaction and gateway restarts.
 
@@ -43,8 +44,9 @@ prepare again.
 - `leetcoder_status` with no ID restores awareness of all ongoing/recent work
   after compaction, including nested OMP child identities and states. With an ID
   it adds child progress, incremental transcript excerpts, `agent://` artifacts,
-  `history://` transcripts, recent events, and live git status. Every view
-  includes the objective, literal current activity, and draft location.
+  `history://` transcripts, recent events, live git status, the latest audit
+  verdict, and accepted facts. Every view includes the objective, literal
+  current activity, and draft location.
 - `leetcoder_steer` immediately redirects an active turn. If the worker is not
   active it durably queues the direction and resumes the native OMP session;
   the root is reminded to reuse a relevant child through `hub` before spawning
@@ -57,4 +59,5 @@ The public MCP surface is deliberately only these four tools:
 `leetcoder_stop`. Do not search for lower-level lifecycle commands.
 
 Never claim completion merely because the OMP worker stopped. Completion is
-truthful only when `handoffComplete` is true or the failure is reported plainly.
+truthful only when independent verification is accepted and `handoffComplete`
+is true; otherwise report the rejection or failure plainly.

@@ -2,9 +2,17 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { LeetcoderDatabase } from "./database.ts";
 import { createWorkspace, inspectRepository } from "./git.ts";
-import { systemPromptPath } from "./paths.ts";
-import { OmpWorkerPool, type OmpRpcWorker } from "./rpc.ts";
+import { auditorPromptPath, systemPromptPath } from "./paths.ts";
+import { OmpRpcWorker, OmpWorkerPool } from "./rpc.ts";
 import { handoffPrompt, initialPrompt, recoveryPrompt, steeringPrompt } from "./templates.ts";
+import {
+  enforceWorkspaceIntegrity,
+  isVerificationAccepted,
+  parseVerificationReport,
+  repairPrompt,
+  verificationPrompt,
+  workspaceFingerprint,
+} from "./verification.ts";
 import type {
   JsonObject,
   LeetcoderConfig,
@@ -13,6 +21,7 @@ import type {
   SessionRecord,
   SubagentRecord,
   SubagentStatus,
+  VerificationRecord,
 } from "./types.ts";
 
 const LIBRARIAN_ADD_TOOL = "mcp__librarian_memory_add";
@@ -183,6 +192,12 @@ export class LeetcoderOrchestrator {
         durableChildRegistry: true,
         incrementalTranscripts: true,
       },
+      verification: {
+        enabled: this.config.verification.enabled,
+        maxRounds: this.config.verification.maxRounds,
+        acceptance: "complete + clean + aligned",
+        auditorProfile: this.config.verification.profile,
+      },
       dataRoot: this.config.paths.dataRoot,
     };
   }
@@ -191,6 +206,8 @@ export class LeetcoderOrchestrator {
     const events = this.db.events(session.id, detailed ? eventLimit : 1);
     const latest = events.at(-1);
     const subagents = this.db.subagents(session.id);
+    const latestVerification = this.db.latestVerification(session.id);
+    const verifiedFacts = this.db.verifiedFacts(session.id);
     const view: JsonObject = {
       id: session.id,
       title: session.title,
@@ -216,6 +233,12 @@ export class LeetcoderOrchestrator {
       },
       ompSessionPath: session.sessionPath,
       nativeSwarm: swarmView(subagents, detailed),
+      verification: {
+        enabled: this.config.verification.enabled,
+        accepted: latestVerification?.accepted ?? false,
+        latest: latestVerification ? verificationView(latestVerification, detailed) : null,
+        acceptedFacts: verifiedFacts.map((item) => detailed ? item : { fact: item.fact, auditId: item.auditId }),
+      },
       createdAt: new Date(session.createdAt).toISOString(),
       updatedAt: new Date(session.updatedAt).toISOString(),
     };
@@ -296,16 +319,75 @@ export class LeetcoderOrchestrator {
       this.db.addEvent(id, "turn_finished", { phase, output: truncate(result.text, 20_000) });
       let subagents = await this.syncSwarmState(id, true);
 
+      let acceptedVerification: VerificationRecord | null = null;
+      let completionClaim = result.text;
+      if (this.config.verification.enabled) {
+        for (let round = 1; round <= this.config.verification.maxRounds; round++) {
+          this.db.setStatus(id, "verifying", `verification-${round}`);
+          this.db.addEvent(id, "verification_started", { round, maxRounds: this.config.verification.maxRounds });
+          const report = await this.runIndependentVerification(this.db.getSession(id), completionClaim, round);
+          const accepted = isVerificationAccepted(report.report);
+          const record = this.db.addVerification(
+            id,
+            round,
+            report.report,
+            accepted,
+            report.workspaceBefore,
+            report.workspaceAfter,
+          );
+          this.db.addEvent(id, accepted ? "verification_accepted" : "verification_rejected", {
+            round,
+            status: record.status,
+            integrity: record.integrity,
+            contractAudit: record.contractAudit,
+            summary: record.summary,
+            completed: record.completed,
+            missing: record.missing,
+            blockers: record.blockers,
+            actionGuidance: record.actionGuidance,
+          });
+          if (accepted) {
+            acceptedVerification = record;
+            break;
+          }
+          if (round >= this.config.verification.maxRounds) {
+            throw new Error(
+              `Independent verification rejected the completion claim after ${round} round(s): ${record.summary}`,
+            );
+          }
+          this.db.setStatus(id, "running", `verification-repair-${round}`);
+          const repaired = await worker.runPrompt(repairPrompt(this.db.getSession(id), record, round));
+          completionClaim = repaired.text;
+          this.db.setLastOutput(id, repaired.text);
+          this.db.addEvent(id, "verification_repair_finished", { round, output: truncate(repaired.text, 20_000) });
+          subagents = await this.syncSwarmState(id, true);
+        }
+      }
+
       session = this.db.getSession(id);
       const closeAfterHandoff = session.status === "closing";
       this.db.resetHandoff(id);
       this.db.setStatus(id, "handoff", "librarian-handoff");
-      let handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, false, subagents));
+      let handoffResult = await worker.runPrompt(handoffPrompt(
+        this.db.getSession(id),
+        completionClaim,
+        false,
+        subagents,
+        acceptedVerification,
+        this.db.verifiedFacts(id),
+      ));
       this.db.setLastOutput(id, handoffResult.text);
       if (!this.db.getSession(id).handoffComplete) {
         this.db.addEvent(id, "handoff_retry", { reason: `${LIBRARIAN_ADD_TOOL} did not complete successfully` });
         subagents = await this.syncSwarmState(id, true);
-        handoffResult = await worker.runPrompt(handoffPrompt(this.db.getSession(id), result.text, true, subagents));
+        handoffResult = await worker.runPrompt(handoffPrompt(
+          this.db.getSession(id),
+          completionClaim,
+          true,
+          subagents,
+          acceptedVerification,
+          this.db.verifiedFacts(id),
+        ));
         this.db.setLastOutput(id, handoffResult.text);
       }
       if (!this.db.getSession(id).handoffComplete) {
@@ -360,6 +442,47 @@ export class LeetcoderOrchestrator {
         }
       },
     };
+  }
+
+  private async runIndependentVerification(session: SessionRecord, claim: string, round: number) {
+    const workspaceBefore = workspaceFingerprint(session.worktree);
+    const auditor = new OmpRpcWorker({
+      key: `${session.id}:audit:${round}:${crypto.randomUUID()}`,
+      command: this.config.omp.command,
+      profile: this.config.verification.profile,
+      cwd: session.worktree,
+      systemPromptPath: auditorPromptPath(),
+      tools: ["read", "grep", "glob", "bash", "lsp"],
+      noSkills: true,
+      noRules: true,
+      noExtensions: true,
+      ephemeral: true,
+      ...(this.config.omp.provider ? { provider: this.config.omp.provider } : {}),
+      ...(this.config.omp.model ? { model: this.config.omp.model } : {}),
+      ...(this.config.omp.thinking ? { thinking: this.config.omp.thinking } : {}),
+      advisor: false,
+      onSession: () => {},
+      onEvent: (event: JsonObject) => {
+        const type = typeof event.type === "string" ? event.type : "unknown";
+        if (new Set(["agent_start", "agent_end", "message_end", "tool_execution_start", "tool_execution_end", "worker_stderr"]).has(type)) {
+          this.db.addEvent(session.id, "verification_agent_event", compactEvent(event));
+        }
+      },
+      onUiRequest: async () => ({ cancelled: true }),
+    });
+    try {
+      await auditor.initialize();
+      await auditor.setSessionName(`Leetcoder audit: ${session.title} (${round})`);
+      const result = await auditor.runPrompt(verificationPrompt(session, claim, round));
+      const workspaceAfter = workspaceFingerprint(session.worktree);
+      return {
+        report: enforceWorkspaceIntegrity(parseVerificationReport(result.text), workspaceBefore, workspaceAfter),
+        workspaceBefore,
+        workspaceAfter,
+      };
+    } finally {
+      await auditor.close();
+    }
   }
 
   private handleWorkerEvent(id: string, event: JsonObject): void {
@@ -463,7 +586,7 @@ function validatePrepare(request: PrepareRequest): void {
 }
 
 function isExecuting(status: string): boolean {
-  return new Set(["starting", "running", "handoff", "closing"]).has(status);
+  return new Set(["starting", "running", "verifying", "handoff", "closing"]).has(status);
 }
 
 function safeSessionStatus(db: LeetcoderDatabase, id: string): string | null {
@@ -640,6 +763,30 @@ function subagentView(subagent: SubagentRecord, parentId: string | null, detaile
   return view;
 }
 
+function verificationView(record: VerificationRecord, detailed: boolean): JsonObject {
+  const view: JsonObject = {
+    id: record.id,
+    round: record.round,
+    accepted: record.accepted,
+    status: record.status,
+    integrity: record.integrity,
+    contractAudit: record.contractAudit,
+    summary: record.summary,
+    completed: record.completed,
+    missing: record.missing,
+    blockers: record.blockers,
+    actionGuidance: record.actionGuidance,
+    evidence: record.evidence,
+    createdAt: new Date(record.createdAt).toISOString(),
+  };
+  if (detailed) {
+    view.workspaceBefore = record.workspaceBefore;
+    view.workspaceAfter = record.workspaceAfter;
+    view.raw = record.raw;
+  }
+  return view;
+}
+
 function parentSubagentId(id: string, ids: Set<string>): string | null {
   const parts = id.split(".");
   while (parts.length > 1) {
@@ -755,6 +902,7 @@ function activitySummary(
     starting: "Preparing the isolated OMP worktree and session",
     running: `OMP is working on the ${session.phase} phase`,
     handoff: "Writing the mandatory Librarian OKF handoff",
+    verifying: "A fresh read-only OMP auditor is checking the milestone against the original contract",
     completed: "Work and Librarian handoff are complete; draft remains available",
     failed: `Work stopped with an error${session.lastError ? `: ${truncate(session.lastError, 300)}` : ""}`,
     paused: "Saved OMP session is queued for automatic recovery",

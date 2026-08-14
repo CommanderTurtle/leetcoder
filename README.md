@@ -23,7 +23,10 @@ flowchart LR
   O -->|"elects bounded delegation"| S["OMP task + hub"]
   S --> C["isolated native subagents"]
   C --> R["agent:// artifacts + history:// transcripts"]
-  O -->|"mandatory memory_add"| L["Librarian OKF handoff"]
+  O -->|"completion claim"| V["fresh read-only OMP auditor"]
+  V -->|"incomplete"| O
+  V -->|"complete + clean + aligned"| FCT["accepted-fact ledger"]
+  FCT -->|"mandatory memory_add"| L["Librarian OKF handoff"]
 ```
 
 Hermes elects whether a bounded assignment deserves Leetcoder. The persistent
@@ -48,6 +51,11 @@ final knowledge handoff.
 - nested subagent status trees with live intent/tool activity plus durable
   `agent://` and `history://` references after Hermes compaction;
 - automatic recovery of interrupted turns after a service restart;
+- a bounded execute/audit/repair loop at completion milestones, using a fresh
+  MCP-free, skill-free OMP auditor and a fail-closed typed verdict;
+- a durable accepted-fact ledger: acting-agent claims remain provisional until
+  the auditor reports `complete`, `clean`, and `aligned` against the original
+  contract and unchanged worktree fingerprint;
 - graceful and force-close semantics with truthful handoff status;
 - a required `mcp__librarian_memory_add` OKF handoff after every completed
   implementation or follow-up turn.
@@ -85,6 +93,7 @@ The generated paths are deliberately outside git:
 ~/.config/leetcoder/token         loopback API bearer token
 ~/.local/share/leetcoder/         database and isolated worktrees
 ~/.omp/profiles/leetcoder/        autonomous OMP profile
+~/.omp/profiles/leetcoder-auditor/ read-only, MCP-free verifier profile
 ```
 
 ## Hermes tools
@@ -131,6 +140,30 @@ runs the root in the background; a child therefore replaces rather than
 overlaps its parent's generation slot. This keeps three root/Advisor pairs,
 Hermes, and Librarian inside the configured eight-sequence local model ceiling.
 
+## Verified completion
+
+Leetcoder does not replace OMP Goal Mode or Hermes continuation. Those harnesses
+remain the single continuation owners. At the end of a Leetcoder implementation
+turn, the gateway opens a separate ephemeral OMP session with only
+`read,grep,glob,bash,lsp`, no skills, no project rules, no extensions, and an
+MCP-empty profile. It receives the original contract, draft location, and the
+acting agent's claimed result, then independently inspects the worktree.
+
+The response uses LongHorizon-Harness' three-part completion boundary:
+
+```text
+Status: complete | incomplete | blocked
+Integrity: clean | suspect | violation
+Contract audit: aligned | unknown | needs_revision | invalid
+```
+
+Only `complete + clean + aligned` enters the SQLite accepted-fact ledger and
+the Librarian handoff. Any other result is routed back to the persistent OMP
+root as concrete repair guidance, then a new auditor session checks again. The
+default limit is two rounds, configurable under `verification.maxRounds` (1–5).
+Malformed output and auditor-caused worktree changes fail closed. Status after
+Hermes compaction includes the latest verdict, evidence, and accepted facts.
+
 Closing never deletes a branch or worktree. Review, merge, archive, or remove
 them explicitly with ordinary git commands after the parent Hermes session has
 accepted the result.
@@ -146,5 +179,6 @@ bun dist/cli.js service restart
 hermes gateway restart
 ```
 
-Run `bun run setup` again only when profile, MCP registration, or durable paths
-change. It is idempotent and keeps the token and existing Leetcoder state.
+Run `bun run setup` once after this verified-completion update so the isolated
+`leetcoder-auditor` profile is created. Later reruns are idempotent and keep the
+token and existing Leetcoder state.

@@ -12,7 +12,8 @@ const server = new McpServer(
       "Leetcoder is Hermes' autonomous control pane for persistent, worktree-isolated OMP roots that may elect OMP's native task/hub swarm. " +
       "Use only its four tools. Prepare with leetcoder_delegate action='prepare'; inspect the returned active sessions yourself, " +
       "then call the same tool with action='confirm' and its token when the work is not a duplicate. Never ask the human to confirm this internal delegation. " +
-      "Use leetcoder_status after compaction or whenever ongoing work is uncertain; it always returns objective, current activity, and draft location."
+      "A fresh read-only auditor must accept the result before handoff or completion. Use leetcoder_status after compaction or whenever ongoing work is uncertain; " +
+      "it always returns objective, current activity, draft location, latest audit verdict, and accepted facts."
   }
 );
 
@@ -58,7 +59,7 @@ server.registerTool(
   {
     title: "Status of OMP delegations",
     description:
-      "Recover Leetcoder awareness after compaction or monitor work. With no sessionId, lists active/recent roots and their native OMP subagent trees. With sessionId, adds incremental child transcripts, artifact/history URIs, detailed events, and git status. Every result includes the objective, literal current activity, and draft worktree/directory.",
+      "Recover Leetcoder awareness after compaction or monitor work. With no sessionId, lists active/recent roots and their native OMP subagent trees. With sessionId, adds incremental child transcripts, artifact/history URIs, detailed events, git status, the latest independent verification, and the accepted-fact ledger. Every result includes the objective, literal current activity, and draft worktree/directory.",
     inputSchema: {
       sessionId: z.string().min(1).optional(),
       includeClosed: z.boolean().default(false),

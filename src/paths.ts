@@ -22,3 +22,7 @@ export function defaultTokenPath(): string {
 export function systemPromptPath(): string {
   return path.join(repoRoot(), "rules", "leetcoder.md");
 }
+
+export function auditorPromptPath(): string {
+  return path.join(repoRoot(), "rules", "auditor.md");
+}

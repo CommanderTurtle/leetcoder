@@ -15,6 +15,7 @@ export type TaskTemplate =
 export type SessionStatus =
   | "starting"
   | "running"
+  | "verifying"
   | "handoff"
   | "completed"
   | "failed"
@@ -52,6 +53,11 @@ export interface LeetcoderConfig {
   };
   confirmation: {
     ttlMinutes: number;
+  };
+  verification: {
+    enabled: boolean;
+    maxRounds: number;
+    profile: string;
   };
   history: {
     eventsPerSession: number;
@@ -116,6 +122,48 @@ export interface SessionEvent {
   createdAt: number;
 }
 
+export type AuditStatus = "complete" | "incomplete" | "blocked";
+export type AuditIntegrity = "clean" | "suspect" | "violation";
+export type ContractAudit = "aligned" | "unknown" | "needs_revision" | "invalid";
+
+export interface AuditEvidence {
+  claim: string;
+  artifact: string;
+  observation: string;
+}
+
+export interface VerificationReport {
+  status: AuditStatus;
+  integrity: AuditIntegrity;
+  contractAudit: ContractAudit;
+  summary: string;
+  completed: string[];
+  missing: string[];
+  blockers: string[];
+  actionGuidance: string[];
+  evidence: AuditEvidence[];
+  raw: string;
+}
+
+export interface VerificationRecord extends VerificationReport {
+  id: number;
+  sessionId: string;
+  round: number;
+  accepted: boolean;
+  workspaceBefore: string;
+  workspaceAfter: string;
+  createdAt: number;
+}
+
+export interface VerifiedFact {
+  id: number;
+  sessionId: string;
+  auditId: number;
+  fact: string;
+  evidence: AuditEvidence[];
+  createdAt: number;
+}
+
 export interface OmpSubagentSnapshot {
   id: string;
   index: number;
@@ -162,6 +210,11 @@ export interface OmpWorkerOptions {
   profile: string;
   cwd: string;
   systemPromptPath: string;
+  tools?: string[];
+  noSkills?: boolean;
+  noRules?: boolean;
+  noExtensions?: boolean;
+  ephemeral?: boolean;
   sessionPath?: string | null;
   provider?: string | null;
   model?: string | null;

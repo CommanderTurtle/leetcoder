@@ -18,6 +18,11 @@
   "confirmation": {
     "ttlMinutes": 15
   },
+  "verification": {
+    "enabled": true,
+    "maxRounds": 2,
+    "profile": "leetcoder-auditor"
+  },
   "history": {
     "eventsPerSession": 5000
   }

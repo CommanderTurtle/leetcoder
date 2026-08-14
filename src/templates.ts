@@ -1,4 +1,4 @@
-import type { SessionRecord, SubagentRecord, TaskTemplate } from "./types.ts";
+import type { SessionRecord, SubagentRecord, TaskTemplate, VerificationRecord, VerifiedFact } from "./types.ts";
 
 const TEMPLATE_GUIDANCE: Record<TaskTemplate, string> = {
   implementation: `Implement the requested capability completely. Inspect the surrounding architecture before editing, preserve established conventions, account for lifecycle and failure paths, and leave a cohesive finished change rather than scaffolding or TODOs.`,
@@ -57,7 +57,14 @@ ${files}
 `;
 }
 
-export function handoffPrompt(session: SessionRecord, finalOutput: string, retry: boolean, subagents: SubagentRecord[] = []): string {
+export function handoffPrompt(
+  session: SessionRecord,
+  finalOutput: string,
+  retry: boolean,
+  subagents: SubagentRecord[] = [],
+  verification: VerificationRecord | null = null,
+  verifiedFacts: VerifiedFact[] = [],
+): string {
   const prefix = retry
     ? "The required durable handoff was not observed. Do this now; do not merely describe it."
     : "The implementation turn is complete. Create its mandatory durable handoff now.";
@@ -77,6 +84,7 @@ The content must include:
 - every changed file and its purpose;
 - native OMP subagents used, their roles, relevant \`agent://\` artifacts and \`history://\` transcripts, or an explicit note that the root elected direct execution;
 - validation performed and its result;
+- independent verification verdict and the accepted-fact ledger below;
 - unresolved blockers, risks, or follow-ups;
 - enough context for another agent to resume without reconstructing this session.
 
@@ -89,6 +97,10 @@ ${truncate(finalOutput || "(no assistant summary was emitted)", 12_000)}
 Native swarm record captured by Leetcoder:
 
 ${renderSwarmRecord(subagents)}
+
+Independent verification boundary:
+
+${renderVerification(verification, verifiedFacts)}
 `;
 }
 
@@ -133,4 +145,23 @@ function renderSwarmRecord(subagents: SubagentRecord[]): string {
 function agentUri(id: string): string {
   const [root, ...children] = id.split(".");
   return children.length ? `agent://${root}/${children.join("/")}` : `agent://${id}`;
+}
+
+function renderVerification(verification: VerificationRecord | null, facts: VerifiedFact[]): string {
+  if (!verification) return "- Verification disabled for this session; acting-agent claims remain explicitly unverified.";
+  const evidence = verification.evidence.length
+    ? verification.evidence.map((item) => `  - ${item.claim} — ${item.artifact}: ${item.observation}`).join("\n")
+    : "  - No evidence entries recorded.";
+  const ledger = facts.length
+    ? facts.map((item) => `  - ${item.fact}`).join("\n")
+    : "  - No facts were accepted.";
+  return `- Round: ${verification.round}
+- Status: ${verification.status}
+- Integrity: ${verification.integrity}
+- Contract audit: ${verification.contractAudit}
+- Summary: ${verification.summary}
+- Evidence:
+${evidence}
+- Accepted facts:
+${ledger}`;
 }

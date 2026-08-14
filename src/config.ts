@@ -16,6 +16,7 @@ export function loadConfig(): LeetcoderConfig {
   const omp = object(raw.omp);
   const paths = object(raw.paths);
   const confirmation = object(raw.confirmation);
+  const verification = object(raw.verification);
   const history = object(raw.history);
   const thinking = optionalString(process.env.LEETCODER_THINKING || omp.thinking);
   if (thinking && !THINKING.has(thinking as ThinkingLevel)) throw new Error(`Invalid OMP thinking level: ${thinking}`);
@@ -40,6 +41,11 @@ export function loadConfig(): LeetcoderConfig {
     },
     confirmation: {
       ttlMinutes: integer(confirmation.ttlMinutes, 15, 1, 1440),
+    },
+    verification: {
+      enabled: booleanValue(process.env.LEETCODER_VERIFICATION || verification.enabled, true),
+      maxRounds: integer(process.env.LEETCODER_VERIFICATION_ROUNDS || verification.maxRounds, 2, 1, 5),
+      profile: optionalString(process.env.LEETCODER_AUDITOR_PROFILE || verification.profile) || "leetcoder-auditor",
     },
     history: {
       eventsPerSession: integer(history.eventsPerSession, 5000, 100, 100000),
@@ -69,6 +75,13 @@ function integer(value: unknown, fallback: number, minimum: number, maximum: num
     throw new Error(`Expected an integer between ${minimum} and ${maximum}; received ${String(value)}`);
   }
   return parsed;
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true" || value === "1") return true;
+  if (value === false || value === "false" || value === "0") return false;
+  throw new Error(`Expected a boolean; received ${String(value)}`);
 }
 
 function expandCommand(value: string): string {

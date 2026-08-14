@@ -45,6 +45,7 @@ if (!existsSync(configFile)) {
     omp: { command: omp, profile: "leetcoder", maxWorkers: 3, idleSeconds: 7200, thinking: "high" },
     paths: { dataRoot },
     confirmation: { ttlMinutes: 15 },
+    verification: { enabled: true, maxRounds: 2, profile: "leetcoder-auditor" },
     history: { eventsPerSession: 5000 },
   }, null, 2)}\n`, { mode: 0o600 });
 }
@@ -65,7 +66,7 @@ Leetcoder is installed.
   Repository:     ${root}
   Config:         ${configFile}
   State:          ${dataRoot}
-  OMP profile:    ~/.omp/profiles/leetcoder
+  OMP profiles:   ~/.omp/profiles/leetcoder + leetcoder-auditor
   Hermes MCP:     leetcoder
   Service:        leetcoder.service
 
@@ -115,18 +116,32 @@ function configureOmpProfile(): void {
   writeFileSync(path.join(target, "mcp.json"), `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
   copyFileSync(sourceModels, path.join(target, "models.yml"));
   chmodSync(path.join(target, "models.yml"), 0o600);
-  syncOmpProviderState(source, target, providers);
+  syncOmpProviderState(source, target, providers, "leetcoder");
   copyFileSync(path.join(root, "rules", "advisor.md"), path.join(target, "WATCHDOG.md"));
   chmodSync(path.join(target, "WATCHDOG.md"), 0o600);
+
+  const auditorTarget = path.join(home, ".omp", "profiles", "leetcoder-auditor", "agent");
+  mkdirSync(auditorTarget, { recursive: true, mode: 0o700 });
+  const auditorConfig = structuredClone(parsed);
+  auditorConfig.advisor = { ...record(auditorConfig.advisor), enabled: false, subagents: false };
+  auditorConfig.task = { ...record(auditorConfig.task), maxConcurrency: 1, maxRecursionDepth: 0, batch: false };
+  writeFileSync(path.join(auditorTarget, "config.yml"), stringify(auditorConfig), { mode: 0o600 });
+  const auditorMcp = JSON.parse(readFileSync(sourceMcp, "utf8")) as unknown;
+  if (!isRecord(auditorMcp)) fail(`OMP MCP config is not a mapping: ${sourceMcp}`);
+  (auditorMcp as McpConfig).mcpServers = {};
+  writeFileSync(path.join(auditorTarget, "mcp.json"), `${JSON.stringify(auditorMcp, null, 2)}\n`, { mode: 0o600 });
+  copyFileSync(sourceModels, path.join(auditorTarget, "models.yml"));
+  chmodSync(path.join(auditorTarget, "models.yml"), 0o600);
+  syncOmpProviderState(source, auditorTarget, providers, "leetcoder-auditor");
 }
 
-function syncOmpProviderState(source: string, target: string, providers: Set<string>): void {
+function syncOmpProviderState(source: string, target: string, providers: Set<string>, profile: string): void {
   if (providers.size === 0) fail("OMP's default profile does not define any model providers");
 
   // Let OMP create its current profile-local database schemas. Leetcoder then
   // copies only the provider rows its model roles actually use; unrelated
   // credentials, usage history, sessions, and settings remain isolated.
-  const initialized = spawnSync(omp, ["--profile", "leetcoder", "models", "--json"], {
+  const initialized = spawnSync(omp, ["--profile", profile, "models", "--json"], {
     cwd: root,
     stdio: "ignore",
   });
@@ -200,6 +215,7 @@ LEETCODER_API_URL=http://127.0.0.1:4749
 LEETCODER_TOKEN_FILE=${quote(tokenFile)}
 OMP_COMMAND=${quote(omp)}
 OMP_PROFILE=leetcoder
+LEETCODER_AUDITOR_PROFILE=leetcoder-auditor
 OTEL_SDK_DISABLED=true
 `;
   writeFileSync(path.join(root, ".env"), content, { mode: 0o600 });
